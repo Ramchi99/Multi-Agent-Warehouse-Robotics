@@ -1,8 +1,11 @@
 import random
 import datetime
+import copy
+import math
+import time
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Mapping, Sequence, Tuple, List, Optional
+from typing import Mapping, Sequence, Tuple, List, Optional, Dict, Any
 
 import numpy as np
 import networkx as nx
@@ -39,6 +42,233 @@ class Pdm4arAgentParams:
     param1: float = 10
 
 
+# --- TASK ALLOCATION LOGIC ---
+
+@dataclass
+class DeliveryTask:
+    goal_id: str
+    collection_id: str
+
+    def clone(self):
+        """Fast shallow copy"""
+        return DeliveryTask(self.goal_id, self.collection_id)
+
+@dataclass
+class RobotSchedule:
+    robot_name: str
+    tasks: List[DeliveryTask]
+
+    def clone(self):
+        """
+        Fast deep copy. 
+        Much faster than copy.deepcopy() because we know the structure.
+        """
+        new_sched = RobotSchedule(self.robot_name, [])
+        # List comprehension is faster than loops
+        new_sched.tasks = [t.clone() for t in self.tasks]
+        return new_sched
+
+class TaskAllocator:
+    """
+    Solves the Multi-Depot Vehicle Routing Problem.
+    Uses Simulated Annealing with Reheating to prevent premature convergence.
+    """
+    def __init__(self, 
+                 cost_matrix: Dict[str, Dict[str, float]], 
+                 robots: List[str], 
+                 goals: List[str], 
+                 collections: List[str]):
+        self.matrix = cost_matrix
+        self.robots = robots
+        self.goals = goals
+        self.collections = collections
+        
+        # Cache best collections for greedy init
+        self.best_collections = {} 
+        for g in self.goals:
+            best_c = None
+            min_c_cost = float('inf')
+            if g in self.matrix:
+                for c in self.collections:
+                    dist = self.matrix[g].get(c, float('inf'))
+                    if dist < min_c_cost:
+                        min_c_cost = dist
+                        best_c = c
+            self.best_collections[g] = best_c
+
+    def solve(self, time_limit: float = 2.0) -> Dict[str, List[DeliveryTask]]:
+        """Runs the Simulated Annealing optimization with Reheating."""
+        start_time = time.time()
+        
+        # 1. Initial Solution (Greedy)
+        current_solution = self._generate_greedy_solution()
+        current_cost = self._evaluate_makespan(current_solution)
+        
+        # Keep track of the absolute best found across all "reheats"
+        best_solution_global = {r: sched.clone() for r, sched in current_solution.items()}
+        best_cost_global = current_cost
+        
+        # Annealing Parameters
+        initial_temp = 100.0
+        temperature = initial_temp
+        cooling_rate = 0.95  # Slightly slower cooling
+        min_temp = 0.5       # Threshold to trigger reheat
+        
+        iterations = 0
+
+        while (time.time() - start_time) < time_limit:
+            iterations += 1
+            
+            # 2. Create Neighbor (Fast Clone)
+            # We copy the dict structure, but we only need to deep clone the schedules 
+            # that we are about to modify. However, for simplicity/safety, we clone all.
+            neighbor_solution = {r: sched.clone() for r, sched in current_solution.items()}
+            
+            # 3. Mutate
+            self._apply_random_mutation(neighbor_solution)
+            
+            # 4. Evaluate
+            neighbor_cost = self._evaluate_makespan(neighbor_solution)
+            
+            # 5. Acceptance Probability
+            delta = neighbor_cost - current_cost
+            
+            # If better, or lucky roll
+            if delta < 0 or random.random() < math.exp(-delta / temperature):
+                current_solution = neighbor_solution
+                current_cost = neighbor_cost
+                
+                # Update Global Best
+                if current_cost < best_cost_global:
+                    best_solution_global = {r: sched.clone() for r, sched in current_solution.items()}
+                    best_cost_global = current_cost
+                    # Optional: Print improvement
+                    # print(f"New Best: {best_cost_global:.2f} (Iter {iterations})")
+            
+            # 6. Cooling & Reheating
+            temperature *= cooling_rate
+            if temperature < min_temp:
+                temperature = initial_temp # REHEAT!
+                # Optional: Reset search to the best known location?
+                # current_solution = {r: sched.clone() for r, sched in best_solution_global.items()}
+                # current_cost = best_cost_global
+            
+        print(f"Allocator: Best Makespan: {best_cost_global:.2f}s | Iterations: {iterations}")
+        return {r: sched.tasks for r, sched in best_solution_global.items()}
+
+    def _generate_greedy_solution(self) -> Dict[str, RobotSchedule]:
+        """Assigns tasks to the robot that can finish it soonest."""
+        schedules = {r: RobotSchedule(r, []) for r in self.robots}
+        robot_completion_times = {r: 0.0 for r in self.robots}
+        robot_locations = {r: r for r in self.robots} 
+
+        unassigned = list(self.goals)
+        
+        while unassigned:
+            best_r = None
+            best_g = None
+            best_c = None
+            min_added_cost = float('inf')
+            
+            for g in unassigned:
+                c = self.best_collections.get(g)
+                if not c: continue
+                
+                for r in self.robots:
+                    curr_loc = robot_locations[r]
+                    dist_to_goal = self.matrix.get(curr_loc, {}).get(g, float('inf'))
+                    dist_to_coll = self.matrix.get(g, {}).get(c, float('inf'))
+                    
+                    if dist_to_goal == float('inf') or dist_to_coll == float('inf'):
+                        continue
+
+                    new_finish_time = robot_completion_times[r] + dist_to_goal + dist_to_coll
+                    
+                    if new_finish_time < min_added_cost:
+                        min_added_cost = new_finish_time
+                        best_r = r
+                        best_g = g
+                        best_c = c
+
+            if best_r:
+                schedules[best_r].tasks.append(DeliveryTask(best_g, best_c))
+                robot_completion_times[best_r] = min_added_cost
+                robot_locations[best_r] = best_c 
+                unassigned.remove(best_g)
+            else:
+                break 
+                
+        return schedules
+
+    def _evaluate_makespan(self, solution: Dict[str, RobotSchedule]) -> float:
+        """Calculates the time the LAST robot finishes its tasks."""
+        max_time = 0.0
+        for r_name, schedule in solution.items():
+            current_node = r_name 
+            total_time = 0.0
+            
+            for task in schedule.tasks:
+                d1 = self.matrix.get(current_node, {}).get(task.goal_id, float('inf'))
+                d2 = self.matrix.get(task.goal_id, {}).get(task.collection_id, float('inf'))
+                
+                # If path is broken, return infinity so this solution is rejected
+                if d1 == float('inf') or d2 == float('inf'):
+                    return float('inf')
+                    
+                total_time += (d1 + d2)
+                current_node = task.collection_id
+            
+            if total_time > max_time:
+                max_time = total_time
+        return max_time
+
+    def _apply_random_mutation(self, solution: Dict[str, RobotSchedule]):
+        """Applies random swaps or dropoff changes."""
+        r_names = list(solution.keys())
+        r1_name = random.choice(r_names)
+        sched1 = solution[r1_name]
+        
+        move_type = random.choice(['swap_owner', 'swap_order', 'change_dropoff'])
+        
+        if not sched1.tasks and move_type != 'swap_owner':
+            move_type = 'swap_owner'
+
+        if move_type == 'swap_owner':
+            r2_name = random.choice(r_names)
+            sched2 = solution[r2_name]
+            
+            if sched1.tasks or sched2.tasks:
+                # Determine source and dest
+                if sched1.tasks and sched2.tasks:
+                    source, dest = (sched1, sched2) if random.random() < 0.5 else (sched2, sched1)
+                elif sched1.tasks:
+                    source, dest = sched1, sched2
+                else:
+                    source, dest = sched2, sched1
+                
+                # Pop and Insert
+                task = source.tasks.pop(random.randint(0, len(source.tasks)-1))
+                insert_idx = random.randint(0, len(dest.tasks)) # Can insert at end
+                dest.tasks.insert(insert_idx, task)
+
+        elif move_type == 'swap_order':
+            if len(sched1.tasks) >= 2:
+                idx1 = random.randint(0, len(sched1.tasks)-1)
+                idx2 = random.randint(0, len(sched1.tasks)-1)
+                sched1.tasks[idx1], sched1.tasks[idx2] = sched1.tasks[idx2], sched1.tasks[idx1]
+
+        elif move_type == 'change_dropoff':
+            if sched1.tasks:
+                task = sched1.tasks[random.randint(0, len(sched1.tasks)-1)]
+                # Try to find a valid random collection, not just any random string
+                possible_cs = [c for c in self.collections if c != task.collection_id]
+                if possible_cs:
+                    new_c = random.choice(possible_cs)
+                    # Only apply if reachable
+                    if self.matrix.get(task.goal_id, {}).get(new_c, float('inf')) < float('inf'):
+                        task.collection_id = new_c
+
+
 class Pdm4arAgent(Agent):
     """This is the PDM4AR agent.
     Do *NOT* modify the naming of the existing methods and the input/output types.
@@ -53,6 +283,7 @@ class Pdm4arAgent(Agent):
     def __init__(self):
         # feel free to remove/modify  the following
         self.params = Pdm4arAgentParams()
+        # self.my_global_path: List[Tuple[float, float]] = []
 
     def on_episode_init(self, init_sim_obs: InitSimObservations):
         pass
@@ -63,7 +294,10 @@ class Pdm4arAgent(Agent):
     ):
         # TODO: process here the received global plan
         global_plan = GlobalPlanMessage.model_validate_json(serialized_msg)
-        # We don't do anything with the plan yet
+        # if self.name in global_plan.paths:
+        #     self.my_global_path = list(global_plan.paths[self.name])
+        # else:
+        #     self.my_global_path = []
 
     def get_commands(self, sim_obs: SimObservations) -> DiffDriveCommands:
         """This method is called by the simulator every dt_commands seconds (0.1s by default).
@@ -99,7 +333,14 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.min_sample_dist = 0.3      # Minimum distance between nodes
         self.turn_penalty = 0.0         # Heuristic cost for "stopping and turning" (meters equivalent)
 
+        self.time_limit = 40.0          # Time limit for task allocation
+
+        self.seed = 41
+
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+
         # --- 1. EXTRACT OBSTACLES & BOUNDS (Done once) ---
         obs_polygons = []
         if init_sim_obs.dg_scenario and init_sim_obs.dg_scenario.static_obstacles:
@@ -122,54 +363,85 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         initial_nodes_data = [] # List of (x, y, type, label)
 
         # Starts
+        robots_list = []
         for name, state in init_sim_obs.initial_states.items():
             special_nodes_plot["starts"].append((state.x, state.y))
             initial_nodes_data.append((state.x, state.y, "start", name))
+            robots_list.append(name)
 
         # Shared Goals
+        goals_list = []
         if init_sim_obs.shared_goals:
             for gid, sgoal in init_sim_obs.shared_goals.items():
                 if hasattr(sgoal, 'polygon'):
                     c = sgoal.polygon.centroid
                     special_nodes_plot["goals"].append((c.x, c.y))
                     initial_nodes_data.append((c.x, c.y, "goal", gid))
+                    goals_list.append(gid)
 
         # Collection Points
+        collections_list = []
         if init_sim_obs.collection_points:
             for cid, cpoint in init_sim_obs.collection_points.items():
                 if hasattr(cpoint, 'polygon'):
                     c = cpoint.polygon.centroid
                     special_nodes_plot["collections"].append((c.x, c.y))
                     initial_nodes_data.append((c.x, c.y, "collection", cid))
+                    collections_list.append(cid)
 
         # --- 3. BUILD PRM ---
         G = self._build_prm(inflated_obstacles, initial_nodes_data, bounds)
 
-        # # --- 4. COMPUTE COST MATRIX & SAMPLE PATH ---
-        # cost_matrix, debug_path = self._compute_cost_matrix(G)
-        # print(f"Computed Cost Matrix for {len(cost_matrix)} POIs")
-
         # --- 4. COMPUTE ROUTING DATA (COSTS & PATHS) ---
         # Returns cost matrix AND a structured dictionary of paths for plotting
         cost_matrix, path_data = self._compute_routing_data(G)
-        
-        # Example: Print a snippet of the cost matrix
         print(f"Computed Cost Matrix for {len(cost_matrix)} nodes.")
 
-        # --- 5. DEBUG PLOT ---
+        # --- 5. TASK ALLOCATION ---
+        allocator = TaskAllocator(cost_matrix, robots_list, goals_list, collections_list)
+        assignments = allocator.solve(self.time_limit)
+        
+        # --- 6. CONSTRUCT FINAL PATHS ---
+        final_planned_paths = {}
+        for r_name, tasks in assignments.items():
+            full_coords = []
+            current_node = r_name 
+            
+            for task in tasks:
+                # 1. Path: Current -> Goal
+                seg1 = self._find_path_coords(path_data, current_node, task.goal_id)
+                # 2. Path: Goal -> Collection
+                seg2 = self._find_path_coords(path_data, task.goal_id, task.collection_id)
+                
+                if seg1: full_coords.extend(seg1)
+                if seg2: full_coords.extend(seg2)
+                
+                current_node = task.collection_id 
+            
+            final_planned_paths[r_name] = full_coords
+
+        # --- 7. DEBUG PLOT ---
         out_dir = Path("out/ex14/debug_plots")
         out_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = out_dir / f"prm_debug_{timestamp}.png"
         
-        self._plot_prm(G, obs_polygons, special_nodes_plot, str(filename), bounds, path_data) #debug_path)
+        self._plot_prm(G, obs_polygons, special_nodes_plot, str(filename), bounds, path_data, final_planned_paths)
 
         # --- 6. RETURN EMPTY PLANS ---
         planned_paths = {p: [] for p in init_sim_obs.players_obs.keys()}
         global_plan_message = GlobalPlanMessage(
+            # paths=final_planned_paths
             paths=planned_paths
         )
         return global_plan_message.model_dump_json(round_trip=True)
+
+    def _find_path_coords(self, path_data, src, dst):
+        """Helper to find path coordinates from any bucket"""
+        for cat in path_data.values():
+            if src in cat and dst in cat[src]:
+                return cat[src][dst]['coords']
+        return []
 
     # def _compute_cost_matrix(self, G):
     #     """
@@ -215,37 +487,27 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         Computes APSP for POIs and extracts ALL paths.
         Returns:
             1. cost_matrix: {SourceLabel: {TargetLabel: Cost}}
-            2. path_data: {
-                   "starts": {SourceLabel: {TargetLabel: {'coords': [...], 'is_best': bool}}},
-                   "goals":  {SourceLabel: {TargetLabel: {'coords': [...], 'is_best': bool}}}
-               }
+            2. path_data: { "starts": ..., "goals": ..., "collections": ... }
         """
         cost_matrix = {}
-        
-        # Structure to hold paths for plotting: 
-        # path_data['starts']['Robot1']['Goal_A'] = coords...
-        path_data = {"starts": {}, "goals": {}}
+        path_data = {"starts": {}, "goals": {}, "collections": {}}
         
         pos = nx.get_node_attributes(G, 'pos')
         
         # 1. Group Nodes
-        # We need indices to run Dijkstra, labels for the dict keys
         starts = [(n, d.get('label')) for n, d in G.nodes(data=True) if d.get('type') == 'start']
         goals = [(n, d.get('label')) for n, d in G.nodes(data=True) if d.get('type') == 'goal']
         collections = [(n, d.get('label')) for n, d in G.nodes(data=True) if d.get('type') == 'collection']
 
-        # Helper to process a group (e.g., All Starts -> All Goals)
+        # Helper to process a group
         def process_group(source_list, target_list, category_key):
             for src_idx, src_label in source_list:
                 if src_label not in cost_matrix: cost_matrix[src_label] = {}
                 if src_label not in path_data[category_key]: path_data[category_key][src_label] = {}
                 
-                # We will track which target is the closest to this specific source
                 best_target_label = None
                 min_cost = float('inf')
-
-                # First pass: Calculate all costs to find the "best" one
-                temp_results = {} # Store results temporarily
+                temp_results = {}
 
                 for tgt_idx, tgt_label in target_list:
                     try:
@@ -262,10 +524,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     except nx.NetworkXNoPath:
                         temp_results[tgt_label] = {'cost': float('inf'), 'coords': None}
 
-                # Second pass: Store in data structures and mark "is_best"
                 for tgt_label, res in temp_results.items():
                     cost_matrix[src_label][tgt_label] = res['cost']
-                    
                     if res['coords']:
                         is_best = (tgt_label == best_target_label)
                         path_data[category_key][src_label][tgt_label] = {
@@ -278,8 +538,64 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
         # 3. Compute Goal -> Collections
         process_group(goals, collections, "goals")
+        
+        # 4. Compute Collection -> Goals (For multi-step missions)
+        process_group(collections, goals, "collections")
 
         return cost_matrix, path_data
+
+    def _get_kinematic_limits(self, sg: DiffDriveGeometry, sp: DiffDriveParameters) -> Tuple[float, float]:
+        """Derives v_max [m/s] and omega_max [rad/s] from robot structures."""
+        # Max wheel rotation (rad/s)
+        w_wheel_max = max(abs(sp.omega_limits[0]), abs(sp.omega_limits[1]))
+        
+        # V_max = r * omega_wheel
+        v_max = sg.wheelradius * w_wheel_max
+        
+        # Omega_max = (2 * r * omega_wheel) / L
+        omega_max = (2 * sg.wheelradius * w_wheel_max) / sg.wheelbase
+        return v_max, omega_max
+
+    def _calculate_path_duration(self, coords: List[Tuple[float, float]]) -> float:
+        """Calculates accurate duration using robot kinematics."""
+        if not coords or len(coords) < 2:
+            return 0.0
+
+        # Use defaults since we are in GlobalPlanner (or pass specific ones if you have them)
+        sg = DiffDriveGeometry.default()
+        sp = DiffDriveParameters.default()
+        
+        v_max, w_max = self._get_kinematic_limits(sg, sp)
+        
+        # Safety clamp
+        if v_max < 1e-4: v_max = 0.1
+        if w_max < 1e-4: w_max = 0.1
+
+        total_time = 0.0
+        current_heading = None
+
+        for i in range(len(coords) - 1):
+            p1 = coords[i]
+            p2 = coords[i+1]
+            
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            dist = math.sqrt(dx**2 + dy**2)
+            
+            # 1. Linear Time
+            total_time += (dist / v_max)
+
+            # 2. Angular Time
+            target_heading = math.atan2(dy, dx)
+            if current_heading is not None:
+                angle_diff = target_heading - current_heading
+                # Normalize to [-pi, pi]
+                angle_diff = (angle_diff + math.pi) % (2 * math.pi) - math.pi
+                total_time += abs(angle_diff) / w_max
+            
+            current_heading = target_heading
+
+        return total_time
 
     def _build_prm(self, inflated_obstacles, initial_nodes_data, bounds) -> nx.Graph:
         """
@@ -311,7 +627,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         min_x, min_y, max_x, max_y = bounds
         width, height = max_x - min_x, max_y - min_y
         
-        sampler = Halton(d=2, scramble=True)
+        sampler = Halton(d=2, scramble=True, seed=self.seed)
         raw_samples = sampler.random(n=self.num_samples * 3) 
         samples_x = raw_samples[:, 0] * width + min_x
         samples_y = raw_samples[:, 1] * height + min_y
@@ -404,16 +720,13 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         
         return G
 
-    def _plot_prm(self, G, obstacles, special_nodes, filename, bounds=None, path_data=None):
+    def _plot_prm(self, G, obstacles, special_nodes, filename, bounds=None, path_data=None, final_paths=None):
         plt.figure(figsize=(12, 12))
         
         # --- 1. Plot Buffered Obstacles (Inflated Boundaries) ---
-        # We re-calculate the buffer here just for visualization so we can see the C-space
         added_buffer_label = False
         for poly in obstacles:
             buffered = poly.buffer(self.robot_radius)
-            
-            # Helper to plot a single polygon geometry
             def plot_poly_outline(geom, label=None):
                 x, y = geom.exterior.xy
                 plt.plot(x, y, 'k--', linewidth=1, alpha=0.5, label=label)
@@ -434,7 +747,6 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # --- 2. Plot Real Obstacles ---
         added_obs_label = False
         for poly in obstacles:
-            # Helper to fill polygon
             def fill_poly(geom, label=None):
                 x, y = geom.exterior.xy
                 plt.fill(x, y, color='gray', alpha=0.5, label=label)
@@ -454,11 +766,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         if pos:
             lines = [[pos[u], pos[v]] for u, v in G.edges()]
             from matplotlib.collections import LineCollection
-            # We don't label every edge, it clutters the legend. We add a proxy artist later if needed.
             lc = LineCollection(lines, colors='green', linewidths=0.5, alpha=0.2)
             plt.gca().add_collection(lc)
-            
-            # Hack to add "Edges" to legend without plotting a dummy line
             plt.plot([], [], color='green', linewidth=0.5, label='PRM Edges')
 
             # --- 4. Plot Nodes (Samples) ---
@@ -476,42 +785,31 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 sx, sy = zip(*special_nodes[key])
                 plt.plot(sx, sy, color=color, marker=marker, linestyle='None', markersize=10, label=label_text, zorder=20)
 
-        # # --- 6. Plot Debug Path ---
-        # if debug_path:
-        #     px, py = zip(*debug_path)
-        #     plt.plot(px, py, 'm-', linewidth=3, label='Sample Path')
-
-        # --- 6. Plot All Paths (Modified Z-Order) ---
-        if path_data:
+        # --- 6. Plot Final Paths (If Available) ---
+        if final_paths:
+            colors = ['cyan', 'magenta', 'yellow', 'lime', 'blue']
+            for i, (robot_name, coords) in enumerate(final_paths.items()):
+                if not coords: continue
+                c = colors[i % len(colors)]
+                plt.plot(*zip(*coords), color=c, linewidth=4, alpha=0.8, label=f'Plan {robot_name}', zorder=30)
+        
+        # Fallback to plotting fragments if no final path
+        elif path_data:
             def plot_category_paths(category, color_code):
                 if category not in path_data: return
                 for src_label, targets in path_data[category].items():
                     for tgt_label, info in targets.items():
                         path = info['coords']
                         is_best = info['is_best']
-                        
                         if is_best:
-                            # Solid Line (Z-Order 5 - Behind Dashed)
-                            plt.plot(*zip(*path), color=color_code, linestyle='-', linewidth=2.5, alpha=0.9, zorder=5)
-                        else:
-                            # Dashed Line (Z-Order 10 - On Top)
-                            # This ensures that if they overlap perfectly, you see the dashes
-                            plt.plot(*zip(*path), color=color_code, linestyle=':', linewidth=2.5, alpha=0.6, zorder=10)
+                            plt.plot(*zip(*path), color=color_code, linestyle='-', linewidth=2.5, alpha=0.4, zorder=5)
 
-            # Robot->Goal: Dark Violet
             plot_category_paths("starts", 'darkviolet') 
-            # Goal->Collection: Dark Orange
             plot_category_paths("goals", 'brown')
-
-            # Legend entries
-            plt.plot([], [], color='darkviolet', linestyle='-', linewidth=2, label='Best (Robot->Goal)')
-            plt.plot([], [], color='darkviolet', linestyle=':', linewidth=1, label='Alt (Robot->Goal)')
-            plt.plot([], [], color='brown', linestyle='-', linewidth=2, label='Best (Goal->Coll)')
-            plt.plot([], [], color='brown', linestyle=':', linewidth=1, label='Alt (Goal->Coll)')
 
         # --- 7. Final Setup ---
         plt.legend(loc="upper right", fontsize='small', framealpha=0.9)
-        plt.title(f"k-NN PRM (N={len(G.nodes)}, Edges={len(G.edges)})")
+        plt.title(f"Plan (N={len(G.nodes)}, Edges={len(G.edges)})")
         plt.axis('equal')
         if bounds:
             plt.xlim(bounds[0], bounds[2])
