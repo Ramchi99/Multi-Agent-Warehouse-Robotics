@@ -90,138 +90,129 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
     """
 
     def __init__(self):
-        # ### [OLD]
-        # self.num_samples = 1000
-        # self.k_neighbors = 20
-        
-        # ### [NEW] Optimized parameters
-        self.num_samples = 2000     # Can handle more samples now
-        self.target_degree = 20     # We WANT this many connections per node
-        self.max_candidates = 50    # We CHECK this many to find the valid ones (handles deleted vertices)
-        self.robot_radius = 0.8     # Buffer size (robot width/2 + margin)
-        self.connection_radius = 10.0 # Max length of an edge
-        self.min_sample_dist = 0.3 # Minimum distance between nodes
+        # Parameters
+        self.num_samples = 2000         # Can handle more samples now
+        self.target_degree = 20         # We WANT this many connections per node
+        self.max_candidates = 50        # We CHECK this many to find the valid ones (handles deleted vertices)
+        self.robot_radius = 0.8         # Buffer size (robot width/2 + margin)
+        self.connection_radius = 10.0   # Max length of an edge
+        self.min_sample_dist = 0.3      # Minimum distance between nodes
 
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
-        # TODO: implement here your global planning stack.
-
-        # --- 1. EXTRACT & INFLATE OBSTACLES ---
+        # --- 1. EXTRACT OBSTACLES & BOUNDS (Done once) ---
         obs_polygons = []
         if init_sim_obs.dg_scenario and init_sim_obs.dg_scenario.static_obstacles:
             for obs in init_sim_obs.dg_scenario.static_obstacles:
                 if hasattr(obs, 'shape'):
                     obs_polygons.append(obs.shape)
         
-        # Buffer obstacles (Configuration Space)
+        # Buffer obstacles
         inflated_obstacles = [o.buffer(self.robot_radius) for o in obs_polygons]
-        combined_obstacles = unary_union(inflated_obstacles)
 
-        # ### [NEW] Build STRtree for O(log N) collision checks (much faster than combined_obstacles)
-        obstacle_tree = STRtree(inflated_obstacles)
-
-        # --- 2. GATHER IMPORTANT NODES ---
-        G = nx.Graph()
+        # Calculate Bounds ONCE (Used for Sampling and Plotting)
+        if obs_polygons:
+            raw_combined = unary_union(obs_polygons)
+            bounds = raw_combined.bounds 
+            # Optional: Add margin to bounds
+            # bounds = (bounds[0]-2, bounds[1]-2, bounds[2]+2, bounds[3]+2)
+        else:
+            bounds = (-12.0, -12.0, 12.0, 12.0)
         
-        # ### [NEW] Keep track of coordinates for KDTree later
-        node_coords = [] # list of [x, y]
-        node_indices = [] # list of node IDs
-
-        # Initialize the spatial grid
-        occupied_grids = set()
-
-        special_nodes = {
-            "starts": [],
-            "goals": [],
-            "collections": []
-        }
+        # --- 2. PREPARE NODES (Iterate once) ---
+        # We build two structures simultaneously to avoid double looping
+        special_nodes_plot = {"starts": [], "goals": [], "collections": []}
+        initial_nodes_data = [] # List of (x, y, type, label)
 
         # Starts
         for name, state in init_sim_obs.initial_states.items():
-            special_nodes["starts"].append((state.x, state.y))
-            # ### [NEW] Add to coord lists
-            idx = len(G.nodes)
-            G.add_node(idx, pos=(state.x, state.y), type="start", label=name)
-            node_coords.append([state.x, state.y])
-            node_indices.append(idx)
-
-            # Mark start node grid cell as occupied
-            gx, gy = int(state.x / self.min_sample_dist), int(state.y / self.min_sample_dist)
-            occupied_grids.add((gx, gy))
+            special_nodes_plot["starts"].append((state.x, state.y))
+            initial_nodes_data.append((state.x, state.y, "start", name))
 
         # Shared Goals
         if init_sim_obs.shared_goals:
             for gid, sgoal in init_sim_obs.shared_goals.items():
                 if hasattr(sgoal, 'polygon'):
                     c = sgoal.polygon.centroid
-                    special_nodes["goals"].append((c.x, c.y))
-                    # ### [NEW] Add to coord lists
-                    idx = len(G.nodes)
-                    G.add_node(idx, pos=(c.x, c.y), type="goal", label=gid)
-                    node_coords.append([c.x, c.y])
-                    node_indices.append(idx)
-
-                    # Mark goal node grid cell as occupied
-                    gx, gy = int(c.x / self.min_sample_dist), int(c.y / self.min_sample_dist)
-                    occupied_grids.add((gx, gy))
+                    special_nodes_plot["goals"].append((c.x, c.y))
+                    initial_nodes_data.append((c.x, c.y, "goal", gid))
 
         # Collection Points
         if init_sim_obs.collection_points:
             for cid, cpoint in init_sim_obs.collection_points.items():
                 if hasattr(cpoint, 'polygon'):
                     c = cpoint.polygon.centroid
-                    special_nodes["collections"].append((c.x, c.y))
-                    # ### [NEW] Add to coord lists
-                    idx = len(G.nodes)
-                    G.add_node(idx, pos=(c.x, c.y), type="collection", label=cid)
-                    node_coords.append([c.x, c.y])
-                    node_indices.append(idx)
+                    special_nodes_plot["collections"].append((c.x, c.y))
+                    initial_nodes_data.append((c.x, c.y, "collection", cid))
 
-                    # Mark collection node grid cell as occupied
-                    gx, gy = int(c.x / self.min_sample_dist), int(c.y / self.min_sample_dist)
-                    occupied_grids.add((gx, gy))
+        # --- 3. BUILD PRM ---
+        # Optimization: removed 'obs_polygons' from arguments. 
+        # The builder only needs bounds and inflated obstacles.
+        G = self._build_prm(inflated_obstacles, initial_nodes_data, bounds)
 
-        # --- 3. SAMPLE REMAINING NODES (HALTON + OB-PRM) ---
-        raw_combined = unary_union(obs_polygons)
-        if not raw_combined.is_empty:
-            bounds = raw_combined.bounds # (minx, miny, maxx, maxy)
-            # ### [NEW] Add margin to bounds so we don't sample exactly on edge of map
-            #bounds = (bounds[0]-2, bounds[1]-2, bounds[2]+2, bounds[3]+2)
-        else:
-            bounds = (-12.0, -12.0, 12.0, 12.0)
-            
+        # --- 4. DEBUG PLOT ---
+        out_dir = Path("out/ex14/debug_plots")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = out_dir / f"prm_debug_{timestamp}.png"
+        
+        self._plot_prm(G, obs_polygons, special_nodes_plot, str(filename), bounds)
+
+        # --- 5. RETURN EMPTY PLANS ---
+        # TODO: Run A* on graph G here
+        planned_paths = {p: [] for p in init_sim_obs.players_obs.keys()}
+        global_plan_message = GlobalPlanMessage(
+            paths=planned_paths
+        )
+        return global_plan_message.model_dump_json(round_trip=True)
+
+    def _build_prm(self, inflated_obstacles, initial_nodes_data, bounds) -> nx.Graph:
+        """
+        Pure logic method. 
+        Changes: Removed obs_polygons arg, used passed-in bounds.
+        """
+        G = nx.Graph()
+        node_coords = [] 
+        node_indices = []
+        occupied_grids = set()
+
+        # Spatial Acceleration
+        obstacle_tree = STRtree(inflated_obstacles)
+        
+        # Boundary for OB-PRM
+        combined_obstacles = unary_union(inflated_obstacles)
+        boundary_geom = combined_obstacles.boundary
+
+        # --- A. ADD INITIAL NODES ---
+        for (x, y, n_type, label) in initial_nodes_data:
+            idx = len(G.nodes)
+            G.add_node(idx, pos=(x, y), type=n_type, label=label)
+            node_coords.append([x, y])
+            node_indices.append(idx)
+            gx, gy = int(x / self.min_sample_dist), int(y / self.min_sample_dist)
+            occupied_grids.add((gx, gy))
+
+        # --- B. SAMPLE REMAINING NODES ---
         min_x, min_y, max_x, max_y = bounds
-        width = max_x - min_x
-        height = max_y - min_y
+        width, height = max_x - min_x, max_y - min_y
         
-        # Initialize Halton sampler
         sampler = Halton(d=2, scramble=True)
-        # Oversample significantly to find enough points
         raw_samples = sampler.random(n=self.num_samples * 3) 
-        
-        # Scale samples to bounds
         samples_x = raw_samples[:, 0] * width + min_x
         samples_y = raw_samples[:, 1] * height + min_y
         
         count = 0
-        boundary_geom = combined_obstacles.boundary
 
         for x, y in zip(samples_x, samples_y):
-            if count >= self.num_samples:
-                break
+            if count >= self.num_samples: break
 
-            # Check if grid cell is already occupied
+            # Grid Check
             gx = int(x / self.min_sample_dist)
             gy = int(y / self.min_sample_dist)
-            if (gx, gy) in occupied_grids:
-                continue # Skip this sample, it's too close to another one
+            if (gx, gy) in occupied_grids: continue
                 
             p = Point(x, y)
             
-            # ### [OLD] Slow check
-            # is_valid = not p.within(combined_obstacles)
-            
-            # ### [NEW] Fast check using STRtree
-            # query returns indices of obstacles that 'might' intersect
+            # Collision Check
             possible_obs_indices = obstacle_tree.query(p)
             is_valid = True
             for obs_idx in possible_obs_indices:
@@ -233,70 +224,36 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             if is_valid:
                 final_point = p
             else:
-                # OB-PRM: Project invalid point to valid surface
+                # OB-PRM Projection
                 try:
                     nearest = nearest_points(p, boundary_geom)[1]
-                    dx = nearest.x - p.x
-                    dy = nearest.y - p.y
+                    dx, dy = nearest.x - p.x, nearest.y - p.y
                     dist = np.sqrt(dx*dx + dy*dy)
-                    
                     if dist > 1e-6:
-                        nudge_dist = 0.1 
-                        nx_vec = (dx / dist) * nudge_dist
-                        ny_vec = (dy / dist) * nudge_dist
-                        final_point = Point(nearest.x + nx_vec, nearest.y + ny_vec)
+                        nudge = 0.1 
+                        final_point = Point(nearest.x + (dx/dist)*nudge, nearest.y + (dy/dist)*nudge)
                     else:
                         final_point = nearest
-                        
                 except Exception:
                     continue
 
             if final_point:
-                # Update the grid with the NEW point's location
-                # Note: If OB-PRM moved the point, calculate grid based on final_point
                 fgx = int(final_point.x / self.min_sample_dist)
                 fgy = int(final_point.y / self.min_sample_dist)
-
-                # Optional: Strict check again for projected points
-                if (fgx, fgy) in occupied_grids:
-                    continue 
+                if (fgx, fgy) in occupied_grids: continue 
                 
                 occupied_grids.add((fgx, fgy))
-
-                # ### [NEW] Add to coord lists and graph
+                
                 idx = len(G.nodes)
                 G.add_node(idx, pos=(final_point.x, final_point.y), type="sample")
                 node_coords.append([final_point.x, final_point.y])
                 node_indices.append(idx)
                 count += 1
 
-        # --- 4. CONNECT k-NEAREST NEIGHBORS (OPTIMIZED) ---
-        
-        # ### [OLD] O(N^2) Approach
-        # node_positions = nx.get_node_attributes(G, 'pos')
-        # nodes_list = list(G.nodes)
-        # for i in nodes_list:
-        #     pos_i = Point(node_positions[i])
-        #     distances = []
-        #     for j in nodes_list:
-        #         if i == j: continue
-        #         pos_j = Point(node_positions[j])
-        #         dist = pos_i.distance(pos_j)
-        #         distances.append((dist, j))
-        #     distances.sort(key=lambda x: x[0])
-        #     neighbors = distances[:self.k_neighbors]
-        #     for dist, j in neighbors:
-        #         pos_j = Point(node_positions[j])
-        #         line = LineString([pos_i, pos_j])
-        #         if not line.intersects(combined_obstacles):
-        #             G.add_edge(i, j, weight=dist)
-
-        # ### [NEW] O(N log N) Approach with Deleted Vertices handling
+        # --- C. CONNECT NODES ---
         if len(node_coords) > 1:
             data_np = np.array(node_coords)
             tree = cKDTree(data_np)
-            
-            # Query more neighbors than we need (max_candidates) to account for collisions
             dists_all, indices_all = tree.query(data_np, k=self.max_candidates)
             
             for i, (nbr_dists, nbr_indices) in enumerate(zip(dists_all, indices_all)):
@@ -305,30 +262,19 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 edges_added = 0
                 
                 for d, j_idx in zip(nbr_dists, nbr_indices):
-                    # Skip self
                     if i == j_idx: continue
-                    
-                    # Stop if we have enough connections (handling "deleted vertices")
                     if edges_added >= self.target_degree: break
-                    
-                    # Stop if neighbor is physically too far
                     if d > self.connection_radius: break
                     
                     v = node_indices[j_idx]
-                    
-                    # Avoid duplicate edge checks
-                    if G.has_edge(u, v):
+                    if G.has_edge(u, v): 
                         edges_added += 1
                         continue
                     
                     v_pos = Point(node_coords[j_idx])
                     line = LineString([u_pos, v_pos])
                     
-                    # Fast Collision Check
-                    # 1. Broad Phase: Get obstacles near the line
                     candidates_idx = obstacle_tree.query(line)
-                    
-                    # 2. Narrow Phase: Check intersection
                     is_colliding = False
                     for idx in candidates_idx:
                         if inflated_obstacles[idx].intersects(line):
@@ -338,91 +284,83 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     if not is_colliding:
                         G.add_edge(u, v, weight=d)
                         edges_added += 1
-
-
-        # --- 5. DEBUG PLOT ---
-        out_dir = Path("out/ex14/debug_plots")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = out_dir / f"prm_debug_{timestamp}.png"
         
-        self._plot_prm(G, obs_polygons, special_nodes, str(filename), bounds)
-
-        # --- 6. RETURN EMPTY PLANS ---
-        # TODO: Run A* on graph G here
-        planned_paths = {p: [] for p in init_sim_obs.players_obs.keys()}
-        global_plan_message = GlobalPlanMessage(
-            paths=planned_paths
-        )
-        return global_plan_message.model_dump_json(round_trip=True)
+        return G
 
     def _plot_prm(self, G, obstacles, special_nodes, filename, bounds=None):
         plt.figure(figsize=(12, 12))
         
-        # 0. Plot Buffered Obstacles (C-Space)
+        # --- 1. Plot Buffered Obstacles (Inflated Boundaries) ---
+        # We re-calculate the buffer here just for visualization so we can see the C-space
+        added_buffer_label = False
         for poly in obstacles:
             buffered = poly.buffer(self.robot_radius)
-            if buffered.geom_type == 'Polygon':
-                x, y = buffered.exterior.xy
-                plt.plot(x, y, 'k--', linewidth=1, alpha=0.5, label='Buffered' if 'Buffered' not in plt.gca().get_legend_handles_labels()[1] else "")
-                for interior in buffered.interiors:
+            
+            # Helper to plot a single polygon geometry
+            def plot_poly_outline(geom, label=None):
+                x, y = geom.exterior.xy
+                plt.plot(x, y, 'k--', linewidth=1, alpha=0.5, label=label)
+                for interior in geom.interiors:
                     x, y = interior.xy
                     plt.plot(x, y, 'k--', linewidth=1, alpha=0.5)
+
+            if buffered.geom_type == 'Polygon':
+                label = "Buffered (C-Space)" if not added_buffer_label else None
+                plot_poly_outline(buffered, label)
+                if label: added_buffer_label = True
             elif buffered.geom_type == 'MultiPolygon':
-                for geom in buffered.geoms:
-                    x, y = geom.exterior.xy
-                    plt.plot(x, y, 'k--', linewidth=1, alpha=0.5)
-                    for interior in geom.interiors:
-                        x, y = interior.xy
-                        plt.plot(x, y, 'k--', linewidth=1, alpha=0.5)
+                for i, geom in enumerate(buffered.geoms):
+                    label = "Buffered (C-Space)" if (not added_buffer_label and i == 0) else None
+                    plot_poly_outline(geom, label)
+                    if label: added_buffer_label = True
 
-        # 1. Plot Real Obstacles
+        # --- 2. Plot Real Obstacles ---
+        added_obs_label = False
         for poly in obstacles:
+            # Helper to fill polygon
+            def fill_poly(geom, label=None):
+                x, y = geom.exterior.xy
+                plt.fill(x, y, color='gray', alpha=0.5, label=label)
+
             if poly.geom_type == 'Polygon':
-                x, y = poly.exterior.xy
-                plt.fill(x, y, color='gray', alpha=0.5, label='Obstacle' if 'Obstacle' not in plt.gca().get_legend_handles_labels()[1] else "")
+                label = "Static Obstacle" if not added_obs_label else None
+                fill_poly(poly, label)
+                if label: added_obs_label = True
             elif poly.geom_type == 'MultiPolygon':
-                 for geom in poly.geoms:
-                    x, y = geom.exterior.xy
-                    plt.fill(x, y, color='gray', alpha=0.5)
-            elif poly.geom_type in ['LineString', 'LinearRing']:
-                x, y = poly.xy
-                plt.plot(x, y, color='gray', linewidth=3, alpha=0.7, label='Boundary' if 'Boundary' not in plt.gca().get_legend_handles_labels()[1] else "")
+                for i, geom in enumerate(poly.geoms):
+                    label = "Static Obstacle" if (not added_obs_label and i == 0) else None
+                    fill_poly(geom, label)
+                    if label: added_obs_label = True
 
-        # 2. Plot Edges
+        # --- 3. Plot Edges ---
         pos = nx.get_node_attributes(G, 'pos')
-        # Collect lines for faster plotting
-        lines = []
-        for (u, v) in G.edges():
-            p1 = pos[u]
-            p2 = pos[v]
-            lines.append([p1, p2])
-        
-        # Plot edges as a collection
-        from matplotlib.collections import LineCollection
-        lc = LineCollection(lines, colors='green', linewidths=0.5, alpha=0.3)
-        plt.gca().add_collection(lc)
+        if pos:
+            lines = [[pos[u], pos[v]] for u, v in G.edges()]
+            from matplotlib.collections import LineCollection
+            # We don't label every edge, it clutters the legend. We add a proxy artist later if needed.
+            lc = LineCollection(lines, colors='green', linewidths=0.5, alpha=0.3)
+            plt.gca().add_collection(lc)
+            
+            # Hack to add "Edges" to legend without plotting a dummy line
+            plt.plot([], [], color='green', linewidth=0.5, label='PRM Edges')
 
-        # 3. Plot Nodes (Samples)
-        sample_x = [pos[n][0] for n in G.nodes if G.nodes[n].get('type') == 'sample']
-        sample_y = [pos[n][1] for n in G.nodes if G.nodes[n].get('type') == 'sample']
-        plt.plot(sample_x, sample_y, 'k.', markersize=1, alpha=0.5, label='Sample')
+            # --- 4. Plot Nodes (Samples) ---
+            sample_x = [pos[n][0] for n in G.nodes if G.nodes[n].get('type') == 'sample']
+            sample_y = [pos[n][1] for n in G.nodes if G.nodes[n].get('type') == 'sample']
+            plt.plot(sample_x, sample_y, 'k.', markersize=1, label='Samples')
 
-        # 4. Plot Special Nodes
-        if special_nodes['starts']:
-            sx, sy = zip(*special_nodes['starts'])
-            plt.plot(sx, sy, 'bo', markersize=8, label='Start')
-        
-        if special_nodes['goals']:
-            gx, gy = zip(*special_nodes['goals'])
-            plt.plot(gx, gy, 'rx', markersize=8, markeredgewidth=2, label='Goal')
+        # --- 5. Plot Special Nodes ---
+        for key, color, marker, label_text in [
+            ('starts', 'b', 'o', 'Start'), 
+            ('goals', 'r', 'x', 'Goal'), 
+            ('collections', 'orange', 'd', 'Collection')
+        ]:
+            if special_nodes[key]:
+                sx, sy = zip(*special_nodes[key])
+                plt.plot(sx, sy, color=color, marker=marker, linestyle='None', markersize=8, label=label_text)
 
-        if special_nodes['collections']:
-            cx, cy = zip(*special_nodes['collections'])
-            plt.plot(cx, cy, 'bd', markersize=8, color='orange', label='Collection')
-
-        plt.legend()
-        # ### [NEW] Updated title
+        # --- 6. Final Setup ---
+        plt.legend(loc="upper right", fontsize='small', framealpha=0.9)
         plt.title(f"k-NN PRM (N={len(G.nodes)}, Edges={len(G.edges)})")
         plt.axis('equal')
         if bounds:
