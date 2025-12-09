@@ -8,7 +8,7 @@ import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 from shapely.geometry import Point, LineString, Polygon
-from shapely.ops import unary_union
+from shapely.ops import unary_union, nearest_points
 from scipy.stats.qmc import Halton
 
 from dg_commons import PlayerName
@@ -85,7 +85,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
     """
 
     def __init__(self):
-        self.num_samples = 500
+        self.num_samples = 1000
         self.k_neighbors = 20
         self.robot_radius = 0.8 # Buffer size (robot width/2 + margin)
 
@@ -139,7 +139,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     special_nodes["collections"].append((c.x, c.y))
                     G.add_node(len(G.nodes), pos=(c.x, c.y), type="collection", label=cid)
 
-        # --- 3. SAMPLE REMAINING NODES (HALTON) ---
+        # --- 3. SAMPLE REMAINING NODES (HALTON + OB-PRM) ---
         # Dynamic bounds from obstacles (use raw obstacles for tighter sampling/plotting limits)
         raw_combined = unary_union(obs_polygons)
         if not raw_combined.is_empty:
@@ -152,22 +152,54 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         height = max_y - min_y
         
         # Initialize Halton sampler
-        # Generate more samples than needed because some will be rejected
         sampler = Halton(d=2, scramble=True)
-        raw_samples = sampler.random(n=self.num_samples * 2) 
+        # Oversample significantly to find enough points
+        raw_samples = sampler.random(n=self.num_samples * 3) 
         
         # Scale samples to bounds
         samples_x = raw_samples[:, 0] * width + min_x
         samples_y = raw_samples[:, 1] * height + min_y
         
         count = 0
+        boundary_geom = combined_obstacles.boundary
+
         for x, y in zip(samples_x, samples_y):
             if count >= self.num_samples:
                 break
                 
             p = Point(x, y)
-            if not p.within(combined_obstacles):
-                G.add_node(len(G.nodes), pos=(x, y), type="sample")
+            is_valid = not p.within(combined_obstacles)
+            
+            final_point = None
+            if is_valid:
+                # Valid free space point
+                final_point = p
+            else:
+                # OB-PRM: Project invalid point to valid surface
+                try:
+                    # nearest_points(p, boundary) returns (p, point_on_boundary)
+                    nearest = nearest_points(p, boundary_geom)[1]
+                    
+                    # Nudge slightly into free space
+                    # Vector from p (inside) to nearest (surface) points OUTWARD
+                    dx = nearest.x - p.x
+                    dy = nearest.y - p.y
+                    dist = np.sqrt(dx*dx + dy*dy)
+                    
+                    if dist > 1e-6:
+                        nudge_dist = 0.1 # 5cm safety margin
+                        nx_vec = (dx / dist) * nudge_dist
+                        ny_vec = (dy / dist) * nudge_dist
+                        final_point = Point(nearest.x + nx_vec, nearest.y + ny_vec)
+                    else:
+                        # If p is exactly on boundary (unlikely), just take it
+                        final_point = nearest
+                        
+                except Exception:
+                    continue
+
+            if final_point:
+                G.add_node(len(G.nodes), pos=(final_point.x, final_point.y), type="sample")
                 count += 1
 
         # --- 4. CONNECT k-NEAREST NEIGHBORS ---
@@ -190,10 +222,6 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             neighbors = distances[:self.k_neighbors]
             
             for dist, j in neighbors:
-                # Add edge if collision free
-                # Note: We check if edge already exists to avoid double work, 
-                # but networkx handles existing edges gracefully (updates weight)
-                
                 pos_j = Point(node_positions[j])
                 line = LineString([pos_i, pos_j])
                 
