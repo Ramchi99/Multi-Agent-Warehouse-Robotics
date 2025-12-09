@@ -11,6 +11,11 @@ from shapely.geometry import Point, LineString, Polygon
 from shapely.ops import unary_union, nearest_points
 from scipy.stats.qmc import Halton
 
+# --- [NEW] Added for efficiency ---
+from scipy.spatial import cKDTree  # For fast neighbor search
+from shapely.strtree import STRtree # For fast collision detection
+# ----------------------------------
+
 from dg_commons import PlayerName
 from dg_commons.sim import InitSimGlobalObservations, InitSimObservations, SharedGoalObservation, SimObservations
 from dg_commons.sim.agents import Agent, GlobalPlanner
@@ -85,17 +90,19 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
     """
 
     def __init__(self):
-        self.num_samples = 1000
-        self.k_neighbors = 20
-        self.robot_radius = 0.8 # Buffer size (robot width/2 + margin)
+        # ### [OLD]
+        # self.num_samples = 1000
+        # self.k_neighbors = 20
+        
+        # ### [NEW] Optimized parameters
+        self.num_samples = 2000     # Can handle more samples now
+        self.target_degree = 20     # We WANT this many connections per node
+        self.max_candidates = 50    # We CHECK this many to find the valid ones (handles deleted vertices)
+        self.robot_radius = 0.8     # Buffer size (robot width/2 + margin)
+        self.connection_radius = 10.0 # Max length of an edge
 
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
         # TODO: implement here your global planning stack.
-        # global_plan_message = GlobalPlanMessage(
-        #     fake_id=1,
-        #     fake_name="agent_1",
-        #     fake_np_data=np.array([[1, 2, 3], [4, 5, 6]]),
-        # )
 
         # --- 1. EXTRACT & INFLATE OBSTACLES ---
         obs_polygons = []
@@ -108,9 +115,16 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         inflated_obstacles = [o.buffer(self.robot_radius) for o in obs_polygons]
         combined_obstacles = unary_union(inflated_obstacles)
 
+        # ### [NEW] Build STRtree for O(log N) collision checks (much faster than combined_obstacles)
+        obstacle_tree = STRtree(inflated_obstacles)
+
         # --- 2. GATHER IMPORTANT NODES ---
         G = nx.Graph()
         
+        # ### [NEW] Keep track of coordinates for KDTree later
+        node_coords = [] # list of [x, y]
+        node_indices = [] # list of node IDs
+
         special_nodes = {
             "starts": [],
             "goals": [],
@@ -120,7 +134,11 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # Starts
         for name, state in init_sim_obs.initial_states.items():
             special_nodes["starts"].append((state.x, state.y))
-            G.add_node(len(G.nodes), pos=(state.x, state.y), type="start", label=name)
+            # ### [NEW] Add to coord lists
+            idx = len(G.nodes)
+            G.add_node(idx, pos=(state.x, state.y), type="start", label=name)
+            node_coords.append([state.x, state.y])
+            node_indices.append(idx)
 
         # Shared Goals
         if init_sim_obs.shared_goals:
@@ -128,22 +146,30 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 if hasattr(sgoal, 'polygon'):
                     c = sgoal.polygon.centroid
                     special_nodes["goals"].append((c.x, c.y))
-                    G.add_node(len(G.nodes), pos=(c.x, c.y), type="goal", label=gid)
+                    # ### [NEW] Add to coord lists
+                    idx = len(G.nodes)
+                    G.add_node(idx, pos=(c.x, c.y), type="goal", label=gid)
+                    node_coords.append([c.x, c.y])
+                    node_indices.append(idx)
 
         # Collection Points
         if init_sim_obs.collection_points:
             for cid, cpoint in init_sim_obs.collection_points.items():
-                # Assuming cpoint is a CollectionPoint object which might have a polygon
                 if hasattr(cpoint, 'polygon'):
                     c = cpoint.polygon.centroid
                     special_nodes["collections"].append((c.x, c.y))
-                    G.add_node(len(G.nodes), pos=(c.x, c.y), type="collection", label=cid)
+                    # ### [NEW] Add to coord lists
+                    idx = len(G.nodes)
+                    G.add_node(idx, pos=(c.x, c.y), type="collection", label=cid)
+                    node_coords.append([c.x, c.y])
+                    node_indices.append(idx)
 
         # --- 3. SAMPLE REMAINING NODES (HALTON + OB-PRM) ---
-        # Dynamic bounds from obstacles (use raw obstacles for tighter sampling/plotting limits)
         raw_combined = unary_union(obs_polygons)
         if not raw_combined.is_empty:
             bounds = raw_combined.bounds # (minx, miny, maxx, maxy)
+            # ### [NEW] Add margin to bounds so we don't sample exactly on edge of map
+            #bounds = (bounds[0]-2, bounds[1]-2, bounds[2]+2, bounds[3]+2)
         else:
             bounds = (-12.0, -12.0, 12.0, 12.0)
             
@@ -168,65 +194,118 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 break
                 
             p = Point(x, y)
-            is_valid = not p.within(combined_obstacles)
+            
+            # ### [OLD] Slow check
+            # is_valid = not p.within(combined_obstacles)
+            
+            # ### [NEW] Fast check using STRtree
+            # query returns indices of obstacles that 'might' intersect
+            possible_obs_indices = obstacle_tree.query(p)
+            is_valid = True
+            for obs_idx in possible_obs_indices:
+                if inflated_obstacles[obs_idx].contains(p):
+                    is_valid = False
+                    break
             
             final_point = None
             if is_valid:
-                # Valid free space point
                 final_point = p
             else:
                 # OB-PRM: Project invalid point to valid surface
                 try:
-                    # nearest_points(p, boundary) returns (p, point_on_boundary)
                     nearest = nearest_points(p, boundary_geom)[1]
-                    
-                    # Nudge slightly into free space
-                    # Vector from p (inside) to nearest (surface) points OUTWARD
                     dx = nearest.x - p.x
                     dy = nearest.y - p.y
                     dist = np.sqrt(dx*dx + dy*dy)
                     
                     if dist > 1e-6:
-                        nudge_dist = 0.1 # 5cm safety margin
+                        nudge_dist = 0.1 
                         nx_vec = (dx / dist) * nudge_dist
                         ny_vec = (dy / dist) * nudge_dist
                         final_point = Point(nearest.x + nx_vec, nearest.y + ny_vec)
                     else:
-                        # If p is exactly on boundary (unlikely), just take it
                         final_point = nearest
                         
                 except Exception:
                     continue
 
             if final_point:
-                G.add_node(len(G.nodes), pos=(final_point.x, final_point.y), type="sample")
+                # ### [NEW] Add to coord lists and graph
+                idx = len(G.nodes)
+                G.add_node(idx, pos=(final_point.x, final_point.y), type="sample")
+                node_coords.append([final_point.x, final_point.y])
+                node_indices.append(idx)
                 count += 1
 
-        # --- 4. CONNECT k-NEAREST NEIGHBORS ---
-        node_positions = nx.get_node_attributes(G, 'pos')
-        nodes_list = list(G.nodes)
+        # --- 4. CONNECT k-NEAREST NEIGHBORS (OPTIMIZED) ---
         
-        for i in nodes_list:
-            pos_i = Point(node_positions[i])
+        # ### [OLD] O(N^2) Approach
+        # node_positions = nx.get_node_attributes(G, 'pos')
+        # nodes_list = list(G.nodes)
+        # for i in nodes_list:
+        #     pos_i = Point(node_positions[i])
+        #     distances = []
+        #     for j in nodes_list:
+        #         if i == j: continue
+        #         pos_j = Point(node_positions[j])
+        #         dist = pos_i.distance(pos_j)
+        #         distances.append((dist, j))
+        #     distances.sort(key=lambda x: x[0])
+        #     neighbors = distances[:self.k_neighbors]
+        #     for dist, j in neighbors:
+        #         pos_j = Point(node_positions[j])
+        #         line = LineString([pos_i, pos_j])
+        #         if not line.intersects(combined_obstacles):
+        #             G.add_edge(i, j, weight=dist)
+
+        # ### [NEW] O(N log N) Approach with Deleted Vertices handling
+        if len(node_coords) > 1:
+            data_np = np.array(node_coords)
+            tree = cKDTree(data_np)
             
-            # Calculate distances to all other nodes
-            distances = []
-            for j in nodes_list:
-                if i == j: continue
-                pos_j = Point(node_positions[j])
-                dist = pos_i.distance(pos_j)
-                distances.append((dist, j))
+            # Query more neighbors than we need (max_candidates) to account for collisions
+            dists_all, indices_all = tree.query(data_np, k=self.max_candidates)
             
-            # Sort and take top k
-            distances.sort(key=lambda x: x[0])
-            neighbors = distances[:self.k_neighbors]
-            
-            for dist, j in neighbors:
-                pos_j = Point(node_positions[j])
-                line = LineString([pos_i, pos_j])
+            for i, (nbr_dists, nbr_indices) in enumerate(zip(dists_all, indices_all)):
+                u = node_indices[i]
+                u_pos = Point(node_coords[i])
+                edges_added = 0
                 
-                if not line.intersects(combined_obstacles):
-                    G.add_edge(i, j, weight=dist)
+                for d, j_idx in zip(nbr_dists, nbr_indices):
+                    # Skip self
+                    if i == j_idx: continue
+                    
+                    # Stop if we have enough connections (handling "deleted vertices")
+                    if edges_added >= self.target_degree: break
+                    
+                    # Stop if neighbor is physically too far
+                    if d > self.connection_radius: break
+                    
+                    v = node_indices[j_idx]
+                    
+                    # Avoid duplicate edge checks
+                    if G.has_edge(u, v):
+                        edges_added += 1
+                        continue
+                    
+                    v_pos = Point(node_coords[j_idx])
+                    line = LineString([u_pos, v_pos])
+                    
+                    # Fast Collision Check
+                    # 1. Broad Phase: Get obstacles near the line
+                    candidates_idx = obstacle_tree.query(line)
+                    
+                    # 2. Narrow Phase: Check intersection
+                    is_colliding = False
+                    for idx in candidates_idx:
+                        if inflated_obstacles[idx].intersects(line):
+                            is_colliding = True
+                            break
+                            
+                    if not is_colliding:
+                        G.add_edge(u, v, weight=d)
+                        edges_added += 1
+
 
         # --- 5. DEBUG PLOT ---
         out_dir = Path("out/ex14/debug_plots")
@@ -237,6 +316,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self._plot_prm(G, obs_polygons, special_nodes, str(filename), bounds)
 
         # --- 6. RETURN EMPTY PLANS ---
+        # TODO: Run A* on graph G here
         planned_paths = {p: [] for p in init_sim_obs.players_obs.keys()}
         global_plan_message = GlobalPlanMessage(
             paths=planned_paths
@@ -309,7 +389,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             plt.plot(cx, cy, 'bd', markersize=8, color='orange', label='Collection')
 
         plt.legend()
-        plt.title(f"k-NN PRM (N={len(G.nodes)}, k={self.k_neighbors})")
+        # ### [NEW] Updated title
+        plt.title(f"k-NN PRM (N={len(G.nodes)}, Edges={len(G.edges)})")
         plt.axis('equal')
         if bounds:
             plt.xlim(bounds[0], bounds[2])
