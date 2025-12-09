@@ -333,9 +333,9 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.min_sample_dist = 0.3      # Minimum distance between nodes
         self.turn_penalty = 0.0         # Heuristic cost for "stopping and turning" (meters equivalent)
 
-        self.time_limit = 40.0          # Time limit for task allocation
+        self.time_limit = 3.0          # Time limit for task allocation
 
-        self.seed = 41
+        self.seed = 42
 
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
         random.seed(self.seed)
@@ -443,44 +443,6 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 return cat[src][dst]['coords']
         return []
 
-    # def _compute_cost_matrix(self, G):
-    #     """
-    #     Computes APSP for POIs and returns matrix + one debug path.
-    #     """
-    #     poi_indices = []
-    #     starts = []
-    #     goals = []
-        
-    #     for n, data in G.nodes(data=True):
-    #         if data.get('type') in ['start', 'goal', 'collection']:
-    #             poi_indices.append(n)
-    #             if data.get('type') == 'start': starts.append(n)
-    #             if data.get('type') == 'goal': goals.append(n)
-        
-    #     matrix = {}
-    #     debug_path = []
-        
-    #     # Calculate Matrix
-    #     for source in poi_indices:
-    #         matrix[source] = {}
-    #         try:
-    #             lengths = nx.single_source_dijkstra_path_length(G, source, weight='weight')
-    #             for target in poi_indices:
-    #                 matrix[source][target] = lengths.get(target, float('inf'))
-    #         except Exception:
-    #             pass
-
-    #     # Calculate One Debug Path (Start[0] -> Goal[0])
-    #     if starts and goals:
-    #         try:
-    #             # Use dijkstra_path to get the actual nodes
-    #             path_nodes = nx.dijkstra_path(G, starts[0], goals[0], weight='weight')
-    #             pos = nx.get_node_attributes(G, 'pos')
-    #             debug_path = [pos[n] for n in path_nodes]
-    #         except nx.NetworkXNoPath:
-    #             pass
-                
-    #     return matrix, debug_path
 
     def _compute_routing_data(self, G) -> Tuple[dict, dict]:
         """
@@ -491,54 +453,61 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         """
         cost_matrix = {}
         path_data = {"starts": {}, "goals": {}, "collections": {}}
-        
         pos = nx.get_node_attributes(G, 'pos')
+
+        # --- Initialize Robot Model for Cost Calculation ---
+        sg_default = DiffDriveGeometry.default()
+        sp_default = DiffDriveParameters.default()
         
-        # 1. Group Nodes
+        # --- [DEBUG PRINT HERE] ---
+        v_debug, w_debug = self._get_kinematic_limits(sg_default, sp_default)
+        print(f"DEBUG KINEMATICS: V_max = {v_debug:.3f} m/s | Omega_max = {w_debug:.3f} rad/s")
+        # --------------------------
+        
         starts = [(n, d.get('label')) for n, d in G.nodes(data=True) if d.get('type') == 'start']
         goals = [(n, d.get('label')) for n, d in G.nodes(data=True) if d.get('type') == 'goal']
         collections = [(n, d.get('label')) for n, d in G.nodes(data=True) if d.get('type') == 'collection']
 
-        # Helper to process a group
         def process_group(source_list, target_list, category_key):
             for src_idx, src_label in source_list:
                 if src_label not in cost_matrix: cost_matrix[src_label] = {}
                 if src_label not in path_data[category_key]: path_data[category_key][src_label] = {}
                 
-                best_target_label = None
-                min_cost = float('inf')
-                temp_results = {}
+                # Temp storage to find best target based on TIME, not DISTANCE
+                candidates = []
 
                 for tgt_idx, tgt_label in target_list:
                     try:
-                        cost = nx.shortest_path_length(G, src_idx, tgt_idx, weight='weight')
+                        # 1. Get Shortest Path by DISTANCE (Geometric Path)
                         path_nodes = nx.shortest_path(G, src_idx, tgt_idx, weight='weight')
                         coords = [pos[n] for n in path_nodes]
                         
-                        temp_results[tgt_label] = {'cost': cost, 'coords': coords}
+                        # 2. Calculate Cost by DURATION (Time)
+                        duration = self._calculate_path_duration(coords)
                         
-                        if cost < min_cost:
-                            min_cost = cost
-                            best_target_label = tgt_label
-                            
+                        candidates.append((duration, tgt_label, coords))
+                        
+                        # Store in matrix
+                        cost_matrix[src_label][tgt_label] = duration
+                        
                     except nx.NetworkXNoPath:
-                        temp_results[tgt_label] = {'cost': float('inf'), 'coords': None}
+                        cost_matrix[src_label][tgt_label] = float('inf')
 
-                for tgt_label, res in temp_results.items():
-                    cost_matrix[src_label][tgt_label] = res['cost']
-                    if res['coords']:
-                        is_best = (tgt_label == best_target_label)
-                        path_data[category_key][src_label][tgt_label] = {
-                            'coords': res['coords'],
-                            'is_best': is_best
+                # 3. Find which target was the "best" (fastest) and mark it
+                if candidates:
+                    candidates.sort(key=lambda x: x[0]) # Sort by duration
+                    best_label = candidates[0][1]
+                    
+                    for cost, label, coords in candidates:
+                        path_data[category_key][src_label][label] = {
+                            'coords': coords,
+                            'is_best': (label == best_label)
                         }
 
         # 2. Compute Robot -> Goals
         process_group(starts, goals, "starts")
-
         # 3. Compute Goal -> Collections
         process_group(goals, collections, "goals")
-        
         # 4. Compute Collection -> Goals (For multi-step missions)
         process_group(collections, goals, "collections")
 
