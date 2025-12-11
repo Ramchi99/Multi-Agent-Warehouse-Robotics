@@ -65,18 +65,46 @@ class TaskAllocatorBase:
                 if d1 == float('inf'): return float('inf')
                 
                 angles_1 = self.heading_matrix.get(current_node, {}).get(task.goal_id, (0.0, 0.0))
-                diff = (angles_1[0] - current_heading + math.pi) % (2 * math.pi) - math.pi
-                total_time += (abs(diff) / self.w_max) + d1
-                current_heading = angles_1[1]
+                # Calculate turn cost considering REVERSE motion
+                target_h = angles_1[0]
+                diff = (target_h - current_heading + math.pi) % (2 * math.pi) - math.pi
+                # Option 1: Forward (turn 'diff')
+                c_fwd = abs(diff)
+                # Option 2: Reverse (turn 'diff' + 180)
+                c_rev = abs(c_fwd - math.pi)
+                
+                # Pick best
+                if c_rev < c_fwd:
+                    turn_cost = c_rev / self.w_max
+                    # If we reverse, we arrive facing the opposite of the standard arrival heading
+                    arrival_heading = (angles_1[1] + math.pi) % (2 * math.pi) - math.pi
+                else:
+                    turn_cost = c_fwd / self.w_max
+                    arrival_heading = angles_1[1]
+
+                total_time += turn_cost + d1
+                current_heading = arrival_heading
                 
                 # --- B. MOVE TO COLLECTION ---
                 d2 = self.matrix.get(task.goal_id, {}).get(task.collection_id, float('inf'))
                 if d2 == float('inf'): return float('inf')
                 
                 angles_2 = self.heading_matrix.get(task.goal_id, {}).get(task.collection_id, (0.0, 0.0))
-                diff = (angles_2[0] - current_heading + math.pi) % (2 * math.pi) - math.pi
-                total_time += (abs(diff) / self.w_max) + d2
-                current_heading = angles_2[1]
+                
+                target_h = angles_2[0]
+                diff = (target_h - current_heading + math.pi) % (2 * math.pi) - math.pi
+                c_fwd = abs(diff)
+                c_rev = abs(c_fwd - math.pi)
+                
+                if c_rev < c_fwd:
+                    turn_cost = c_rev / self.w_max
+                    arrival_heading = (angles_2[1] + math.pi) % (2 * math.pi) - math.pi
+                else:
+                    turn_cost = c_fwd / self.w_max
+                    arrival_heading = angles_2[1]
+                
+                total_time += turn_cost + d2
+                current_heading = arrival_heading
                 
                 current_node = task.collection_id
             
@@ -95,21 +123,125 @@ class TaskAllocatorBase:
             # 1. To Goal
             d1 = self.matrix.get(current_node, {}).get(task.goal_id, 0.0)
             angles_1 = self.heading_matrix.get(current_node, {}).get(task.goal_id, (0.0, 0.0))
-            diff1 = (angles_1[0] - current_heading + math.pi) % (2 * math.pi) - math.pi
-            total_time += (abs(diff1) / self.w_max) + d1
-            current_heading = angles_1[1]
+            
+            target_h = angles_1[0]
+            diff = (target_h - current_heading + math.pi) % (2 * math.pi) - math.pi
+            c_fwd = abs(diff)
+            c_rev = abs(c_fwd - math.pi)
+            
+            if c_rev < c_fwd:
+                turn_cost = c_rev / self.w_max
+                arrival_heading = (angles_1[1] + math.pi) % (2 * math.pi) - math.pi
+            else:
+                turn_cost = c_fwd / self.w_max
+                arrival_heading = angles_1[1]
+                
+            total_time += turn_cost + d1
+            current_heading = arrival_heading
             
             # 2. To Collection
             d2 = self.matrix.get(task.goal_id, {}).get(task.collection_id, 0.0)
             angles_2 = self.heading_matrix.get(task.goal_id, {}).get(task.collection_id, (0.0, 0.0))
-            diff2 = (angles_2[0] - current_heading + math.pi) % (2 * math.pi) - math.pi
-            total_time += (abs(diff2) / self.w_max) + d2
-            current_heading = angles_2[1]
+            
+            target_h = angles_2[0]
+            diff = (target_h - current_heading + math.pi) % (2 * math.pi) - math.pi
+            c_fwd = abs(diff)
+            c_rev = abs(c_fwd - math.pi)
+            
+            if c_rev < c_fwd:
+                turn_cost = c_rev / self.w_max
+                arrival_heading = (angles_2[1] + math.pi) % (2 * math.pi) - math.pi
+            else:
+                turn_cost = c_fwd / self.w_max
+                arrival_heading = angles_2[1]
+                
+            total_time += turn_cost + d2
+            current_heading = arrival_heading
             
             current_node = task.collection_id
             
         return total_time
     
+    def _print_schedule_debug(self, solution: Dict[str, RobotSchedule]):
+        print("\n" + "="*60)
+        print("DEBUG: DETAILED SCHEDULE KINEMATICS (Reverse-Aware)")
+        print("="*60)
+        
+        for r_name, sched in solution.items():
+            if not sched.tasks:
+                print(f"[Robot {r_name}] IDLE")
+                continue
+                
+            print(f"[Robot {r_name}] {len(sched.tasks)} Tasks")
+            curr_node = r_name
+            curr_heading = self.initial_headings.get(r_name, 0.0)
+            
+            total_time = 0.0
+            
+            for i, task in enumerate(sched.tasks):
+                print(f"  Task {i+1}: {curr_node} -> {task.goal_id} -> {task.collection_id}")
+                
+                # --- Segment 1: To Goal ---
+                d1 = self.matrix.get(curr_node, {}).get(task.goal_id, 0.0)
+                angles_1 = self.heading_matrix.get(curr_node, {}).get(task.goal_id, (0.0, 0.0))
+                target_h = angles_1[0]
+                
+                # Turn Logic
+                diff = (target_h - curr_heading + math.pi) % (2 * math.pi) - math.pi
+                c_fwd = abs(diff)
+                c_rev = abs(c_fwd - math.pi)
+                
+                is_reverse = c_rev < c_fwd
+                turn_rad = c_rev if is_reverse else c_fwd
+                turn_time = turn_rad / self.w_max
+                
+                if is_reverse:
+                    arr_heading = (angles_1[1] + math.pi) % (2 * math.pi) - math.pi
+                    move_type = "REVERSE"
+                else:
+                    arr_heading = angles_1[1]
+                    move_type = "FORWARD"
+                
+                print(f"    1. To Goal ({task.goal_id}):")
+                print(f"       Start Head: {curr_heading:.2f} | Path Vector: {target_h:.2f}")
+                print(f"       Action: {move_type} | Turn: {turn_rad:.2f} rad ({turn_time:.2f}s)")
+                print(f"       Travel: {d1:.2f}s | Total Seg: {turn_time + d1:.2f}s")
+                
+                total_time += turn_time + d1
+                curr_heading = arr_heading
+                
+                # --- Segment 2: To Collection ---
+                d2 = self.matrix.get(task.goal_id, {}).get(task.collection_id, 0.0)
+                angles_2 = self.heading_matrix.get(task.goal_id, {}).get(task.collection_id, (0.0, 0.0))
+                target_h = angles_2[0]
+                
+                diff = (target_h - curr_heading + math.pi) % (2 * math.pi) - math.pi
+                c_fwd = abs(diff)
+                c_rev = abs(c_fwd - math.pi)
+                
+                is_reverse = c_rev < c_fwd
+                turn_rad = c_rev if is_reverse else c_fwd
+                turn_time = turn_rad / self.w_max
+                
+                if is_reverse:
+                    arr_heading = (angles_2[1] + math.pi) % (2 * math.pi) - math.pi
+                    move_type = "REVERSE"
+                else:
+                    arr_heading = angles_2[1]
+                    move_type = "FORWARD"
+                
+                print(f"    2. To Coll ({task.collection_id}):")
+                print(f"       Start Head: {curr_heading:.2f} | Path Vector: {target_h:.2f}")
+                print(f"       Action: {move_type} | Turn: {turn_rad:.2f} rad ({turn_time:.2f}s)")
+                print(f"       Travel: {d2:.2f}s | Total Seg: {turn_time + d2:.2f}s")
+                
+                total_time += turn_time + d2
+                curr_heading = arr_heading
+                
+                curr_node = task.collection_id
+                
+            print(f"  >> Total Robot Time: {total_time:.2f}s")
+            
 class TaskAllocatorSA(TaskAllocatorBase):
     """Original Simulated Annealing Implementation"""
     def __init__(self, *args, **kwargs):
@@ -372,10 +504,18 @@ class TaskAllocatorLNS(TaskAllocatorBase):
                 d_pg = self.matrix.get(prev_loc, {}).get(task.goal_id, float('inf'))
                 angles_pg = self.heading_matrix.get(prev_loc, {}).get(task.goal_id, (0.0, 0.0))
                 
-                # Turn to Goal
-                diff_pg = (angles_pg[0] - prev_heading + math.pi) % (2 * math.pi) - math.pi
-                cost_pg = (abs(diff_pg) / self.w_max) + d_pg
-                heading_at_goal = angles_pg[1]
+                # Turn to Goal (Bidirectional)
+                target_h = angles_pg[0]
+                diff = (target_h - prev_heading + math.pi) % (2 * math.pi) - math.pi
+                c_fwd = abs(diff)
+                c_rev = abs(c_fwd - math.pi)
+                
+                if c_rev < c_fwd:
+                    cost_pg = (c_rev / self.w_max) + d_pg
+                    heading_at_goal = (angles_pg[1] + math.pi) % (2 * math.pi) - math.pi
+                else:
+                    cost_pg = (c_fwd / self.w_max) + d_pg
+                    heading_at_goal = angles_pg[1]
                 
                 # Iterate all Collections
                 for c in self.collections:
@@ -384,9 +524,18 @@ class TaskAllocatorLNS(TaskAllocatorBase):
                     if d_gc == float('inf'): continue
                     
                     angles_gc = self.heading_matrix.get(task.goal_id, {}).get(c, (0.0, 0.0))
-                    diff_gc = (angles_gc[0] - heading_at_goal + math.pi) % (2 * math.pi) - math.pi
-                    cost_gc = (abs(diff_gc) / self.w_max) + d_gc
-                    heading_at_c = angles_gc[1]
+                    
+                    target_h = angles_gc[0]
+                    diff = (target_h - heading_at_goal + math.pi) % (2 * math.pi) - math.pi
+                    c_fwd = abs(diff)
+                    c_rev = abs((diff + math.pi) % (2 * math.pi) - math.pi)
+                    
+                    if c_rev < c_fwd:
+                        cost_gc = (c_rev / self.w_max) + d_gc
+                        heading_at_c = (angles_gc[1] + math.pi) % (2 * math.pi) - math.pi
+                    else:
+                        cost_gc = (c_fwd / self.w_max) + d_gc
+                        heading_at_c = angles_gc[1]
                     
                     # C -> Next (if exists)
                     cost_cn = 0.0
@@ -394,8 +543,13 @@ class TaskAllocatorLNS(TaskAllocatorBase):
                         d_cn = self.matrix.get(c, {}).get(next_loc, float('inf'))
                         if d_cn == float('inf'): continue
                         angles_cn = self.heading_matrix.get(c, {}).get(next_loc, (0.0, 0.0))
-                        diff_cn = (angles_cn[0] - heading_at_c + math.pi) % (2 * math.pi) - math.pi
-                        cost_cn = (abs(diff_cn) / self.w_max) + d_cn
+                        
+                        target_h = angles_cn[0]
+                        diff = (target_h - heading_at_c + math.pi) % (2 * math.pi) - math.pi
+                        c_fwd = abs(diff)
+                        c_rev = abs((diff + math.pi) % (2 * math.pi) - math.pi)
+                        
+                        cost_cn = (min(c_fwd, c_rev) / self.w_max) + d_cn
                     
                     total = cost_pg + cost_gc + cost_cn
                     
@@ -408,13 +562,36 @@ class TaskAllocatorLNS(TaskAllocatorBase):
                 
                 # Update pointers for next iteration
                 prev_loc = best_c
-                # Heading leaving C towards Next (or just sitting at C)
-                # If next_loc exists, we leave C. If not, we stay.
+                
+                # We need to correctly propagate heading based on the "best_c" choice
+                # Re-calculate the specific exit heading for the chosen C
                 if next_loc:
-                    prev_heading = self.heading_matrix.get(best_c, {}).get(next_loc, (0.0, 0.0))[1]
+                    angles_next = self.heading_matrix.get(best_c, {}).get(next_loc, (0.0, 0.0))
+                    # Check arriving at C (re-calc)
+                    angles_gc = self.heading_matrix.get(task.goal_id, {}).get(best_c, (0.0, 0.0))
+                    # We need to know if we arrived at C "reversed" to know start heading for Next?
+                    # Actually, heading_matrix[c][next][0] is the start heading.
+                    # The turn cost calculation handles the diff.
+                    # But we need "heading_at_c" (arrival) to feed into the NEXT loop as "prev_heading".
+                    
+                    # Re-run logic for best_c to get exit heading
+                    target_h_gc = angles_gc[0]
+                    diff_gc = (target_h_gc - heading_at_goal + math.pi) % (2 * math.pi) - math.pi
+                    if abs((diff_gc + math.pi) % (2 * math.pi) - math.pi) < abs(diff_gc):
+                         heading_at_c = (angles_gc[1] + math.pi) % (2 * math.pi) - math.pi
+                    else:
+                         heading_at_c = angles_gc[1]
+
+                    prev_heading = heading_at_c # Arriving at C, ready to turn to Next
                 else:
-                    # Heading arriving at C
-                    prev_heading = self.heading_matrix.get(task.goal_id, {}).get(best_c, (0.0, 0.0))[1]
+                    # Same logic if it's the last one, just to update state
+                    angles_gc = self.heading_matrix.get(task.goal_id, {}).get(best_c, (0.0, 0.0))
+                    target_h_gc = angles_gc[0]
+                    diff_gc = (target_h_gc - heading_at_goal + math.pi) % (2 * math.pi) - math.pi
+                    if abs((diff_gc + math.pi) % (2 * math.pi) - math.pi) < abs(diff_gc):
+                         prev_heading = (angles_gc[1] + math.pi) % (2 * math.pi) - math.pi
+                    else:
+                         prev_heading = angles_gc[1]
 
 
     def _destroy_random(self, solution, n):
@@ -748,20 +925,38 @@ class TaskAllocatorLNS2(TaskAllocatorLNS):
         if d_sg == float('inf'): return float('inf')
         
         angles_sg = self.heading_matrix.get(start_node, {}).get(task0.goal_id, (0.0, 0.0))
-        # Turn to start path
-        turn_sg = abs((angles_sg[0] - start_heading + math.pi) % (2 * math.pi) - math.pi) / self.w_max
+        target_h = angles_sg[0]
+        diff = (target_h - start_heading + math.pi) % (2 * math.pi) - math.pi
+        c_fwd = abs(diff)
+        c_rev = abs((diff + math.pi) % (2 * math.pi) - math.pi)
+        
+        if c_rev < c_fwd:
+            turn_sg = c_rev / self.w_max
+            heading_arrival_g0 = (angles_sg[1] + math.pi) % (2 * math.pi) - math.pi
+        else:
+            turn_sg = c_fwd / self.w_max
+            heading_arrival_g0 = angles_sg[1]
+            
         cost_arrival_g0 = turn_sg + d_sg
-        heading_arrival_g0 = angles_sg[1]
         
         for c in self.collections:
             d_gc = self.matrix.get(task0.goal_id, {}).get(c, float('inf'))
             if d_gc == float('inf'): continue
             
             angles_gc = self.heading_matrix.get(task0.goal_id, {}).get(c, (0.0, 0.0))
-            turn_gc = abs((angles_gc[0] - heading_arrival_g0 + math.pi) % (2 * math.pi) - math.pi) / self.w_max
-            total = cost_arrival_g0 + turn_gc + d_gc
-            heading_arrival_c = angles_gc[1]
+            target_h = angles_gc[0]
+            diff = (target_h - heading_arrival_g0 + math.pi) % (2 * math.pi) - math.pi
+            c_fwd = abs(diff)
+            c_rev = abs((diff + math.pi) % (2 * math.pi) - math.pi)
             
+            if c_rev < c_fwd:
+                turn_gc = c_rev / self.w_max
+                heading_arrival_c = (angles_gc[1] + math.pi) % (2 * math.pi) - math.pi
+            else:
+                turn_gc = c_fwd / self.w_max
+                heading_arrival_c = angles_gc[1]
+            
+            total = cost_arrival_g0 + turn_gc + d_gc
             layer0[c] = (total, None, heading_arrival_c)
             
         dp.append(layer0)
@@ -782,10 +977,20 @@ class TaskAllocatorLNS2(TaskAllocatorLNS):
                 if d_pg == float('inf'): continue
                 
                 angles_pg = self.heading_matrix.get(prev_c, {}).get(curr_task.goal_id, (0.0, 0.0))
-                # Turn from arrival at Prev_C to start of path to Goal
-                turn_pg = abs((angles_pg[0] - prev_heading_arr + math.pi) % (2 * math.pi) - math.pi) / self.w_max
+                
+                target_h = angles_pg[0]
+                diff = (target_h - prev_heading_arr + math.pi) % (2 * math.pi) - math.pi
+                c_fwd = abs(diff)
+                c_rev = abs((diff + math.pi) % (2 * math.pi) - math.pi)
+                
+                if c_rev < c_fwd:
+                    turn_pg = c_rev / self.w_max
+                    heading_arr_g = (angles_pg[1] + math.pi) % (2 * math.pi) - math.pi
+                else:
+                    turn_pg = c_fwd / self.w_max
+                    heading_arr_g = angles_pg[1]
+
                 cost_arr_g = prev_cost + turn_pg + d_pg
-                heading_arr_g = angles_pg[1]
                 
                 # 2. Goal_i -> Curr_C
                 for curr_c in self.collections:
@@ -793,9 +998,20 @@ class TaskAllocatorLNS2(TaskAllocatorLNS):
                     if d_gc == float('inf'): continue
                     
                     angles_gc = self.heading_matrix.get(curr_task.goal_id, {}).get(curr_c, (0.0, 0.0))
-                    turn_gc = abs((angles_gc[0] - heading_arr_g + math.pi) % (2 * math.pi) - math.pi) / self.w_max
+                    
+                    target_h = angles_gc[0]
+                    diff = (target_h - heading_arr_g + math.pi) % (2 * math.pi) - math.pi
+                    c_fwd = abs(diff)
+                    c_rev = abs(c_fwd - math.pi)
+                    
+                    if c_rev < c_fwd:
+                        turn_gc = c_rev / self.w_max
+                        heading_arr_curr_c = (angles_gc[1] + math.pi) % (2 * math.pi) - math.pi
+                    else:
+                        turn_gc = c_fwd / self.w_max
+                        heading_arr_curr_c = angles_gc[1]
+                        
                     total_new_cost = cost_arr_g + turn_gc + d_gc
-                    heading_arr_curr_c = angles_gc[1]
                     
                     # Store if best
                     if curr_c not in curr_layer or total_new_cost < curr_layer[curr_c][0]:
@@ -1047,10 +1263,19 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         # equivalent to Random but slower. Disable it to match LNS2's speed.
         if n_tasks < 10:
             self.scores['spatial'] = 0.0
+            
+        iterations_since_improvement = 0
         
         # ALNS Loop
         while (time.time() - start_time) < time_limit:
             iterations += 1
+            
+            # [IMPROVEMENT] Variable Neighborhood Size (VND)
+            # SOTA Technique: Scale destruction based on stagnation.
+            # - High improvement rate? Use small N=1 for speed/polishing.
+            # - Stuck? Gradually increase N to break out (Diversification).
+            base_n = 1 + int(iterations_since_improvement / 20) ##########!!!!!!!!!!!!!!!!!!!!############ 100 vs 20
+            n_remove = min(max_rem, base_n)
             
             # A. Select Operator
             op_name = self._select_operator()
@@ -1060,7 +1285,6 @@ class TaskAllocatorALNS(TaskAllocatorBase):
             temp_sol = {r: sched.clone() for r, sched in current_sol.items()}
             
             # C. Destroy
-            n_remove = random.randint(min_rem, max_rem)
             removed_tasks = []
             
             if op_name == 'random':
@@ -1071,8 +1295,10 @@ class TaskAllocatorALNS(TaskAllocatorBase):
                 temp_sol, removed_tasks = self._destroy_spatial(temp_sol, n_remove)
             
             # D. Repair
-            # We use Regret with Noise as the standard robust repair operator
-            temp_sol = self._repair_regret_noise(temp_sol, removed_tasks, noise_level=0.2)
+            # Scale noise with temperature: High T -> High Noise (Exploration)
+            # Low T -> Low Noise (Precision)
+            current_noise = 0.2 * (temperature / 50.0)
+            temp_sol = self._repair_regret_noise(temp_sol, removed_tasks, noise_level=current_noise)
             
             # E. Intensify (Micro-Optimization)
             self._intensify_solution(temp_sol)
@@ -1091,11 +1317,16 @@ class TaskAllocatorALNS(TaskAllocatorBase):
                     reward = self.sigma_1
                     best_sol = {r: sched.clone() for r, sched in temp_sol.items()}
                     best_cost = new_cost
+                    iterations_since_improvement = 0 # Reset VND (Focus on polishing this new best)
                 else:
                     reward = self.sigma_2
+                    iterations_since_improvement += 1
             elif random.random() < math.exp(-delta / max(temperature, 1e-5)):
                 accepted = True
                 reward = self.sigma_3
+                iterations_since_improvement += 1
+            else:
+                iterations_since_improvement += 1
             
             if accepted:
                 current_sol = temp_sol
@@ -1110,6 +1341,9 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         print(f"ALNS Finished: Best Cost {best_cost:.2f} | Iterations: {iterations}")
         print(f"Operator Scores: {self.scores}")
         print(f"Operator Usage: {self.usage_counts}")
+        
+        # [DEBUG] Print Detailed Kinematics
+        self._print_schedule_debug(best_sol)
         
         return {r: sched.tasks for r, sched in best_sol.items()}
 
@@ -1135,9 +1369,9 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         # Never let 'random' drop below a safe floor.
         # This prevents the algorithm from becoming too greedy/deterministic.
         if op_name == 'random':
-            self.scores['random'] = max(0.5, self.scores['random'])
+            self.scores['random'] = max(0.6, self.scores['random'])
         elif op_name == 'worst':
-            self.scores['worst'] = max(0.5, self.scores['worst'])
+            self.scores['worst'] = max(0.4, self.scores['worst'])
 
     # --- 1. DESTROY OPERATORS ---
     
@@ -1282,9 +1516,19 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         if d_pg == float('inf'): return float('inf'), None
         
         angles_pg = self.heading_matrix.get(prev_loc, {}).get(task.goal_id, (0.0, 0.0))
-        turn_pg = abs((angles_pg[0] - prev_heading + math.pi) % (2*math.pi) - math.pi) / self.w_max
+        target_h = angles_pg[0]
+        diff = (target_h - prev_heading + math.pi) % (2 * math.pi) - math.pi
+        c_fwd = abs(diff)
+        c_rev = abs((diff + math.pi) % (2 * math.pi) - math.pi)
+        
+        if c_rev < c_fwd:
+            turn_pg = c_rev / self.w_max
+            heading_at_goal = (angles_pg[1] + math.pi) % (2 * math.pi) - math.pi
+        else:
+            turn_pg = c_fwd / self.w_max
+            heading_at_goal = angles_pg[1]
+
         cost_pg = turn_pg + d_pg
-        heading_at_goal = angles_pg[1]
         
         # Optimize C
         best_c = None
@@ -1295,17 +1539,34 @@ class TaskAllocatorALNS(TaskAllocatorBase):
             if d_gc == float('inf'): continue
             
             angles_gc = self.heading_matrix.get(task.goal_id, {}).get(c, (0.0, 0.0))
-            turn_gc = abs((angles_gc[0] - heading_at_goal + math.pi) % (2*math.pi) - math.pi) / self.w_max
+            
+            target_h = angles_gc[0]
+            diff = (target_h - heading_at_goal + math.pi) % (2 * math.pi) - math.pi
+            c_fwd = abs(diff)
+            c_rev = abs(c_fwd - math.pi)
+            
+            if c_rev < c_fwd:
+                turn_gc = c_rev / self.w_max
+                heading_at_c = (angles_gc[1] + math.pi) % (2 * math.pi) - math.pi
+            else:
+                turn_gc = c_fwd / self.w_max
+                heading_at_c = angles_gc[1]
+
             cost_gc = turn_gc + d_gc
-            heading_at_c = angles_gc[1]
             
             cost_cn = 0.0
             if next_loc:
                 d_cn = self.matrix.get(c, {}).get(next_loc, float('inf'))
                 if d_cn == float('inf'): continue
                 angles_cn = self.heading_matrix.get(c, {}).get(next_loc, (0.0, 0.0))
-                turn_cn = abs((angles_cn[0] - heading_at_c + math.pi) % (2*math.pi) - math.pi) / self.w_max
-                cost_cn = turn_cn + d_cn
+                
+                target_h = angles_cn[0]
+                diff = (target_h - heading_at_c + math.pi) % (2 * math.pi) - math.pi
+                c_fwd = abs(diff)
+                c_rev = abs(c_fwd - math.pi)
+                
+                # We don't track heading after this, just cost
+                cost_cn = (min(c_fwd, c_rev) / self.w_max) + d_cn
             
             if (cost_gc + cost_cn) < min_seg:
                 min_seg = cost_gc + cost_cn
@@ -1319,8 +1580,12 @@ class TaskAllocatorALNS(TaskAllocatorBase):
             d_pn = self.matrix.get(prev_loc, {}).get(next_loc, float('inf'))
             if d_pn < float('inf'):
                 angles_pn = self.heading_matrix.get(prev_loc, {}).get(next_loc, (0.0, 0.0))
-                turn_pn = abs((angles_pn[0] - prev_heading + math.pi) % (2*math.pi) - math.pi) / self.w_max
-                removed = turn_pn + d_pn
+                target_h = angles_pn[0]
+                diff = (target_h - prev_heading + math.pi) % (2 * math.pi) - math.pi
+                c_fwd = abs(diff)
+                c_rev = abs(c_fwd - math.pi)
+                
+                removed = (min(c_fwd, c_rev) / self.w_max) + d_pn
                 
         return added - removed, best_c
 
@@ -1374,55 +1639,107 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         if not tasks: return 0.0
         dp = []
         
-        # Layer 0
+        # --- Layer 0: Start -> Goal0 -> C ---
         task0 = tasks[0]
         layer0 = {}
+        
         d_sg = self.matrix.get(start_node, {}).get(task0.goal_id, float('inf'))
         if d_sg == float('inf'): return float('inf')
         
         angles_sg = self.heading_matrix.get(start_node, {}).get(task0.goal_id, (0.0, 0.0))
-        turn_sg = abs((angles_sg[0] - start_heading + math.pi) % (2 * math.pi) - math.pi) / self.w_max
+        target_h = angles_sg[0]
+        diff = (target_h - start_heading + math.pi) % (2 * math.pi) - math.pi
+        c_fwd = abs(diff)
+        c_rev = abs((diff + math.pi) % (2 * math.pi) - math.pi)
+        
+        if c_rev < c_fwd:
+            turn_sg = c_rev / self.w_max
+            heading_arrival_g0 = (angles_sg[1] + math.pi) % (2 * math.pi) - math.pi
+        else:
+            turn_sg = c_fwd / self.w_max
+            heading_arrival_g0 = angles_sg[1]
+            
         cost_arrival_g0 = turn_sg + d_sg
-        heading_arrival_g0 = angles_sg[1]
         
         for c in self.collections:
             d_gc = self.matrix.get(task0.goal_id, {}).get(c, float('inf'))
             if d_gc == float('inf'): continue
+            
             angles_gc = self.heading_matrix.get(task0.goal_id, {}).get(c, (0.0, 0.0))
-            turn_gc = abs((angles_gc[0] - heading_arrival_g0 + math.pi) % (2 * math.pi) - math.pi) / self.w_max
+            target_h = angles_gc[0]
+            diff = (target_h - heading_arrival_g0 + math.pi) % (2 * math.pi) - math.pi
+            c_fwd = abs(diff)
+            c_rev = abs(c_fwd - math.pi)
+            
+            if c_rev < c_fwd:
+                turn_gc = c_rev / self.w_max
+                heading_arrival_c = (angles_gc[1] + math.pi) % (2 * math.pi) - math.pi
+            else:
+                turn_gc = c_fwd / self.w_max
+                heading_arrival_c = angles_gc[1]
+            
             total = cost_arrival_g0 + turn_gc + d_gc
-            heading_arrival_c = angles_gc[1]
             layer0[c] = (total, None, heading_arrival_c)
+            
         dp.append(layer0)
         
-        # Layers 1..N
+        # --- Layers 1..N: Prev_C -> Goal_i -> Curr_C ---
         for i in range(1, len(tasks)):
             curr_task = tasks[i]
             prev_layer = dp[-1]
             curr_layer = {}
+            
             if not prev_layer: return float('inf')
             
+            # We iterate all possible Prev_C to find best path to Curr_C
             for prev_c, (prev_cost, _, prev_heading_arr) in prev_layer.items():
+                
+                # 1. Prev_C -> Goal_i
                 d_pg = self.matrix.get(prev_c, {}).get(curr_task.goal_id, float('inf'))
                 if d_pg == float('inf'): continue
                 
                 angles_pg = self.heading_matrix.get(prev_c, {}).get(curr_task.goal_id, (0.0, 0.0))
-                turn_pg = abs((angles_pg[0] - prev_heading_arr + math.pi) % (2 * math.pi) - math.pi) / self.w_max
-                cost_arr_g = prev_cost + turn_pg + d_pg
-                heading_arr_g = angles_pg[1]
+                target_h = angles_pg[0]
+                diff = (target_h - prev_heading_arr + math.pi) % (2 * math.pi) - math.pi
+                c_fwd = abs(diff)
+                c_rev = abs(c_fwd - math.pi)
                 
+                if c_rev < c_fwd:
+                    turn_pg = c_rev / self.w_max
+                    heading_arr_g = (angles_pg[1] + math.pi) % (2 * math.pi) - math.pi
+                else:
+                    turn_pg = c_fwd / self.w_max
+                    heading_arr_g = angles_pg[1]
+                
+                cost_arr_g = prev_cost + turn_pg + d_pg
+                
+                # 2. Goal_i -> Curr_C
                 for curr_c in self.collections:
                     d_gc = self.matrix.get(curr_task.goal_id, {}).get(curr_c, float('inf'))
                     if d_gc == float('inf'): continue
-                    angles_gc = self.heading_matrix.get(curr_task.goal_id, {}).get(curr_c, (0.0, 0.0))
-                    turn_gc = abs((angles_gc[0] - heading_arr_g + math.pi) % (2 * math.pi) - math.pi) / self.w_max
-                    total_new_cost = cost_arr_g + turn_gc + d_gc
-                    heading_arr_curr_c = angles_gc[1]
                     
+                    angles_gc = self.heading_matrix.get(curr_task.goal_id, {}).get(curr_c, (0.0, 0.0))
+                    target_h = angles_gc[0]
+                    diff = (target_h - heading_arr_g + math.pi) % (2 * math.pi) - math.pi
+                    c_fwd = abs(diff)
+                    c_rev = abs(c_fwd - math.pi)
+                    
+                    if c_rev < c_fwd:
+                        turn_gc = c_rev / self.w_max
+                        heading_arr_curr_c = (angles_gc[1] + math.pi) % (2 * math.pi) - math.pi
+                    else:
+                        turn_gc = c_fwd / self.w_max
+                        heading_arr_curr_c = angles_gc[1]
+                        
+                    total_new_cost = cost_arr_g + turn_gc + d_gc
+                    
+                    # Store if best
                     if curr_c not in curr_layer or total_new_cost < curr_layer[curr_c][0]:
                         curr_layer[curr_c] = (total_new_cost, prev_c, heading_arr_curr_c)
+            
             dp.append(curr_layer)
             
+        # --- Backtrack ---
         last_layer = dp[-1]
         if not last_layer: return float('inf')
         
