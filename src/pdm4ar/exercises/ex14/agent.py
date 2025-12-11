@@ -30,7 +30,7 @@ from dg_commons.sim.models.obstacles import StaticObstacle
 from numpydantic import NDArray
 from pydantic import BaseModel
 
-from .task_allocator import DeliveryTask, RobotSchedule, TaskAllocatorSA, TaskAllocatorLNS  # , TaskAllocatorLNS2
+from .task_allocator import DeliveryTask, RobotSchedule, TaskAllocatorSA, TaskAllocatorLNS, TaskAllocatorLNS2, TaskAllocatorLNS3
 
 
 class GlobalPlanMessage(BaseModel):
@@ -102,7 +102,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
     def __init__(self):
         # Parameters
-        self.num_samples = 3000  # Can handle more samples now # 2000
+        self.num_samples = 2000  # Can handle more samples now # 2000
         self.target_degree = 20  # We WANT this many connections per node
         self.max_candidates = 50  # We CHECK this many to find the valid ones (handles deleted vertices)
         self.robot_radius = 0.6 + 0.1  # Buffer size (robot width/2 + margin)
@@ -110,7 +110,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.min_sample_dist = 0.3  # Minimum distance between nodes # 0.3
         self.turn_penalty = 0.0  # Heuristic cost for "stopping and turning" (meters equivalent)
 
-        self.time_limit = 20.0  # Time limit for task allocation
+        self.time_limit = 10.0  # Time limit for task allocation
 
         self.seed = 42
 
@@ -183,18 +183,6 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         cost_matrix, path_data, heading_matrix = self._compute_routing_data(G)
         print(f"Computed Cost Matrix for {len(cost_matrix)} nodes.")
 
-        # # 4. Initialize Allocator with new args
-        # allocator = TaskAllocator(
-        #     cost_matrix=cost_matrix,
-        #     heading_matrix=heading_matrix,
-        #     initial_headings=initial_headings,
-        #     w_max=w_max,
-        #     robots=robots_list,
-        #     goals=goals_list,
-        #     collections=collections_list
-        # )
-        # assignments = allocator.solve(self.time_limit)
-
         # 4. Initialize Allocator ARGS
         alloc_args = {
             "cost_matrix": cost_matrix,
@@ -206,46 +194,54 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             "collections": collections_list,
         }
 
-        # 5. Run BOTH Algorithms (Comparison Mode)
-
         # A. Run SA
         allocator_sa = TaskAllocatorSA(**alloc_args)
         # Give SA 30% of time or a fixed amount
-        sa_assignments = allocator_sa.solve(time_limit=self.time_limit * 0.5)
+        sa_assignments = allocator_sa.solve(time_limit=self.time_limit)
         sa_cost = allocator_sa._evaluate_makespan({r: RobotSchedule(r, t) for r, t in sa_assignments.items()})
 
         # B. Run LNS
         allocator_lns = TaskAllocatorLNS(**alloc_args)
         # Give LNS more time as it's the primary target
-        lns_assignments = allocator_lns.solve(time_limit=self.time_limit * 0.5)
+        lns_assignments = allocator_lns.solve(time_limit=self.time_limit)
         lns_cost = allocator_lns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns_assignments.items()})
 
-        # # C. Run LNS2
-        # # allocator_lns2 = TaskAllocatorLNS2(**alloc_args)
-        # # lns2_assignments = allocator_lns2.solve(time_limit=self.time_limit * 0.5)
-        # # lns2_cost = allocator_lns2._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns2_assignments.items()})
+        # B. Run LNS2
+        allocator_lns2 = TaskAllocatorLNS2(**alloc_args)
+        # Give LNS more time as it's the primary target
+        lns2_assignments = allocator_lns2.solve(time_limit=self.time_limit)
+        lns2_cost = allocator_lns2._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns2_assignments.items()})
+
+        # B. Run LNS3
+        allocator_lns3 = TaskAllocatorLNS3(**alloc_args)
+        # Give LNS more time as it's the primary target
+        lns3_assignments = allocator_lns3.solve(time_limit=self.time_limit)
+        lns3_cost = allocator_lns3._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns3_assignments.items()})
+
 
         print(f"--- RESULT COMPARISON ---")
         print(f"SA Cost:  {sa_cost:.2f}")
         print(f"LNS Cost: {lns_cost:.2f}")
-        # print(f"LNS2 Cost: {lns2_cost:.2f}")
+        print(f"LNS2 Cost: {lns2_cost:.2f}")
+        print(f"LNS3 Cost: {lns3_cost:.2f}")
 
         # --- NEW: Call Debug Printer ---
-        self._print_debug_comparison(sa_assignments, lns_assignments, cost_matrix, heading_matrix)
+        # self._print_debug_comparison(sa_assignments, lns_assignments, cost_matrix, heading_matrix)
         # -------------------------------
 
         # Pick the winner
-        if lns_cost <= sa_cost:
+        if lns3_cost <= sa_cost and lns3_cost <= lns_cost and lns3_cost <= lns2_cost:
+            print(">> Using LNS3 Plan")
+            assignments = lns3_assignments
+        elif lns2_cost <= sa_cost and lns2_cost <= lns_cost:
+            print(">> Using LNS2 Plan")
+            assignments = lns2_assignments
+        elif lns_cost <= sa_cost:
             print(">> Using LNS Plan")
             assignments = lns_assignments
         else:
             print(">> Using SA Plan")
             assignments = sa_assignments
-
-        # # Check LNS2
-        # # if lns2_cost <= sa_cost and lns2_cost <= lns_cost:
-        # #     print(">> Using LNS2 Plan")
-        # #     assignments = lns2_assignments
 
         # --- 6. CONSTRUCT FINAL PATHS ---
         final_planned_paths = {}
