@@ -2,6 +2,7 @@ import random
 import datetime
 import copy
 import math
+from re import A
 import time
 from pathlib import Path
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from numpydantic import NDArray
 from pydantic import BaseModel
 
 from .task_allocator import DeliveryTask, RobotSchedule, TaskAllocatorSA, TaskAllocatorLNS, TaskAllocatorLNS2, TaskAllocatorLNS3, TaskAllocatorALNS
+from .spacetime_planner import SpaceTimeRoadmapPlanner
 
 
 class GlobalPlanMessage(BaseModel):
@@ -110,7 +112,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.min_sample_dist = 0.3  # Minimum distance between nodes # 0.3
         self.turn_penalty = 0.0  # Heuristic cost for "stopping and turning" (meters equivalent)
 
-        self.time_limit = 10.0  # Time limit for task allocation # 10.0
+        self.time_limit = 5.0  # Time limit for task allocation # 10.0
 
         self.seed = 42
 
@@ -169,12 +171,12 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # --- 3. BUILD PRM ---
         G = self._build_prm(inflated_obstacles, initial_nodes_data, bounds)
 
-        # 1. Get Initial Headings
+        # 4. Get Initial Headings
         initial_headings = {}
         for name, state in init_sim_obs.initial_states.items():
             initial_headings[name] = state.psi
 
-        # 2. Get Kinematics for Allocator
+        # 5. Get Kinematics for Allocator
         sg = DiffDriveGeometry.default()
         sp = DiffDriveParameters.default()
         _, w_max = self._get_kinematic_limits(sg, sp)
@@ -182,12 +184,12 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # --- Create STRtree for Smoothing ---
         obstacle_tree = STRtree(inflated_obstacles)
 
-        # --- 4. COMPUTE ROUTING DATA (COSTS & PATHS) ---
+        # --- 6. COMPUTE ROUTING DATA (COSTS & PATHS) ---
         # [MODIFIED] Now passing obstacle data for smoothing
         cost_matrix, path_data, heading_matrix = self._compute_routing_data(G, obstacle_tree, inflated_obstacles)
         print(f"Computed Cost Matrix for {len(cost_matrix)} nodes.")
 
-        # 4. Initialize Allocator ARGS
+        # 7. Initialize Allocator ARGS
         alloc_args = {
             "cost_matrix": cost_matrix,
             "heading_matrix": heading_matrix,
@@ -210,19 +212,19 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         lns_assignments = allocator_lns.solve(time_limit=self.time_limit)
         lns_cost = allocator_lns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns_assignments.items()})
 
-        # B. Run LNS2
+        # C. Run LNS2
         allocator_lns2 = TaskAllocatorLNS2(**alloc_args)
         # Give LNS more time as it's the primary target
         lns2_assignments = allocator_lns2.solve(time_limit=self.time_limit)
         lns2_cost = allocator_lns2._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns2_assignments.items()})
 
-        # B. Run LNS3
+        # D. Run LNS3
         allocator_lns3 = TaskAllocatorLNS3(**alloc_args)
         # Give LNS more time as it's the primary target
         lns3_assignments = allocator_lns3.solve(time_limit=self.time_limit)
         lns3_cost = allocator_lns3._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns3_assignments.items()})
 
-        # B. Run ALNS (Adaptive)
+        # E. Run ALNS (Adaptive)
         allocator_alns = TaskAllocatorALNS(**alloc_args)
         alns_assignments = allocator_alns.solve(time_limit=self.time_limit)
         alns_cost = allocator_alns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in alns_assignments.items()})
@@ -235,7 +237,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         print(f"ALNS Cost: {alns_cost:.2f}")
 
         # --- NEW: Call Debug Printer ---
-        # self._print_debug_comparison(sa_assignments, lns_assignments, cost_matrix, heading_matrix)
+        # self._print_debug_comparison(sa_assignments, alns_assignments, cost_matrix, heading_matrix)
         # -------------------------------
 
         # Pick the winner
@@ -255,7 +257,14 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             print(">> Using SA Plan")
             assignments = sa_assignments
 
-        # --- 6. CONSTRUCT FINAL PATHS ---
+        # --- AUTO-RETURN TO START ---
+        # Prevents deadlocks by clearing collection points
+        for r_name in assignments:
+            # Task: Go to 'r_name' (Start Node) and stay there
+            return_task = DeliveryTask(goal_id=r_name, collection_id=r_name)
+            assignments[r_name].append(return_task)
+
+        # --- 8. CONSTRUCT FINAL PATHS ---
         final_planned_paths = {}
         for r_name, tasks in assignments.items():
             full_coords = []
@@ -276,7 +285,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
             final_planned_paths[r_name] = full_coords
 
-        # --- 7. DEBUG PLOT ---
+        # --- 9. DEBUG PLOT ---
         out_dir = Path("out/ex14/debug_plots")
         out_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -284,7 +293,73 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
         self._plot_prm(G, obs_polygons, special_nodes_plot, str(filename), bounds, path_data, final_planned_paths)
 
-        # --- 6. RETURN EMPTY PLANS ---
+        # ---------------------------------------------------------------------
+        # --- 10. NEW: SPACE-TIME EXECUTION PLANNING (LOGIC INSERTION) ---
+        # ---------------------------------------------------------------------
+        print(">> Running Space-Time Execution Planning...")
+        
+        # A. Setup Planner
+        v_max, w_max = self._get_kinematic_limits(sg, sp)
+        
+        st_planner = SpaceTimeRoadmapPlanner(
+            prm_graph=G,
+            robot_radius=self.robot_radius,
+            v_max=v_max, 
+            w_max=w_max,
+            dt_search=0.1, # High precision time steps
+            use_prm=False # Tunnel-Path Only Mode (Saves RAM)
+        )
+        
+        # B. Prepare States
+        initial_poses = {
+            name: (s.x, s.y, s.psi) 
+            for name, s in init_sim_obs.initial_states.items()
+        }
+        
+        # C. Run Planning
+        # The planner handles the stitching internally for its own use
+        timed_plans, mission_times = st_planner.plan_prioritized(
+            assignments=assignments,
+            path_data=path_data,
+            initial_states=initial_poses
+        )
+        
+        # D. Plot Execution (The Bubble Plot)
+        filename_exec = out_dir / f"spacetime_exec_{timestamp}.png"
+        st_planner.plot_execution(
+            filename=str(filename_exec),
+            obstacles=obs_polygons,
+            special_nodes=special_nodes_plot
+        )
+
+        # ---------------------------------------------------------------------
+        # --- 11. RETURN FINAL PLAN ---
+        # ---------------------------------------------------------------------
+        # We return the TIMED plans because they are safer/better, 
+        # but the logic flow above remained valid.
+        
+        paths_output = {}
+        for r_name, points in timed_plans.items():
+            # Extract (x, y, theta, t)
+            paths_output[r_name] = [(p.x, p.y, p.theta, p.t) for p in points]
+        
+        # Fallback: if st_planner returned empty for a robot (deadlock), 
+        # we can fallback to the old geometric path (untimed) if you wish,
+        # but usually better to wait. The st_planner returns dummy waits on fail, 
+        # so this is safe.
+
+        # global_plan_message = GlobalPlanMessage(
+        #     paths=paths_output
+        # )
+        # return global_plan_message.model_dump_json(round_trip=True)
+
+        # --- Debug: Final Makespan (Mission Only) ---
+        max_makespan = 0.0
+        if mission_times:
+            max_makespan = max(mission_times.values())
+        print(f"\n>>> FINAL PLAN MAKESPAN: {max_makespan:.2f}s <<<\n")
+
+        # --- 12. RETURN EMPTY PLANS ---
         planned_paths = {p: [] for p in init_sim_obs.players_obs.keys()}
         global_plan_message = GlobalPlanMessage(
             # paths=final_planned_paths
@@ -398,6 +473,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         process_group(goals, collections, "goals")
         # 4. Compute Collection -> Goals (For multi-step missions)
         process_group(collections, goals, "collections")
+        # 5. Compute Collection -> Starts (For Return-to-Base)
+        process_group(collections, starts, "collections")
 
         return cost_matrix, path_data, heading_matrix
 
