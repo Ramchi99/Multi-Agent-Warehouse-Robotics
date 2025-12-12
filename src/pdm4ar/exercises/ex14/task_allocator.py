@@ -50,6 +50,7 @@ class TaskAllocatorBase:
         self.goals = goals
         self.collections = collections
         self.eval_count = 0  # Track number of path evaluations
+        self.history = [] # (time, cost) tuples
 
     def _evaluate_makespan(self, solution: Dict[str, RobotSchedule]) -> float:
         self.eval_count += len(solution)  # Count evaluation for each robot
@@ -259,7 +260,7 @@ class TaskAllocatorSA(TaskAllocatorBase):
                         best_c = c
             self.best_collections[g] = best_c
 
-    def solve(self, time_limit: float = 2.0) -> Dict[str, List[DeliveryTask]]:
+    def solve(self, time_limit: float = 2.0) -> Tuple[Dict[str, List[DeliveryTask]], List[Tuple[float, float]]]:
         print(f"--- Running SA Allocator (Time Limit: {time_limit}s) ---")
         start_time = time.time()
         
@@ -268,6 +269,8 @@ class TaskAllocatorSA(TaskAllocatorBase):
         
         best_solution_global = {r: sched.clone() for r, sched in current_solution.items()}
         best_cost_global = current_cost
+        
+        self.history.append((0.0, best_cost_global))
         
         temperature = 100.0
         cooling_rate = 0.95
@@ -286,12 +289,13 @@ class TaskAllocatorSA(TaskAllocatorBase):
                 if current_cost < best_cost_global:
                     best_solution_global = {r: sched.clone() for r, sched in current_solution.items()}
                     best_cost_global = current_cost
+                    self.history.append((time.time() - start_time, best_cost_global))
             
             temperature *= cooling_rate
             if temperature < 0.5: temperature = 100.0 # Reheat
 
         print(f"SA Finished: Best Cost {best_cost_global:.2f} | Iterations: {iterations} | Evals: {self.eval_count}")
-        return {r: sched.tasks for r, sched in best_solution_global.items()}
+        return {r: sched.tasks for r, sched in best_solution_global.items()}, self.history
     
     def _generate_greedy_solution(self) -> Dict[str, RobotSchedule]:
         """Assigns tasks to the robot that can finish it soonest, accounting for TURN COSTS."""
@@ -425,7 +429,7 @@ class TaskAllocatorLNS(TaskAllocatorBase):
     """
     State-of-the-Art LNS with Post-Repair Smoothing.
     """
-    def solve(self, time_limit: float = 2.0) -> Dict[str, List[DeliveryTask]]:
+    def solve(self, time_limit: float = 2.0) -> Tuple[Dict[str, List[DeliveryTask]], List[Tuple[float, float]]]:
         print(f"--- Running LNS Allocator (Time Limit: {time_limit}s) ---")
         start_time = time.time()
         
@@ -441,6 +445,7 @@ class TaskAllocatorLNS(TaskAllocatorBase):
         
         best_sol = {r: sched.clone() for r, sched in current_sol.items()}
         best_cost = self._evaluate_makespan(best_sol)
+        self.history.append((0.0, best_cost))
         
         iterations = 0
         n_remove = max(1, min(4, int(len(self.goals) * 0.4)))
@@ -472,11 +477,12 @@ class TaskAllocatorLNS(TaskAllocatorBase):
                 best_cost = new_cost
                 best_sol = {r: sched.clone() for r, sched in temp_sol.items()}
                 current_sol = temp_sol
+                self.history.append((time.time() - start_time, best_cost))
             elif random.random() < 0.05:
                 current_sol = temp_sol
 
         print(f"LNS Finished: Best Cost {best_cost:.2f} | Iterations: {iterations} | Evals: {self.eval_count}")
-        return {r: sched.tasks for r, sched in best_sol.items()}
+        return {r: sched.tasks for r, sched in best_sol.items()}, self.history
 
     def _optimize_solution_dropoffs(self, solution):
         """
@@ -772,7 +778,7 @@ class TaskAllocatorLNS2(TaskAllocatorLNS):
     Guarantees optimal sequencing for small clusters using Permutations + Viterbi DP.
     """
     
-    def solve(self, time_limit: float = 2.0) -> Dict[str, List[DeliveryTask]]:
+    def solve(self, time_limit: float = 2.0) -> Tuple[Dict[str, List[DeliveryTask]], List[Tuple[float, float]]]:
         print(f"--- Running Hybrid LNS2 (Time Limit: {time_limit}s) ---")
         start_time = time.time()
         
@@ -787,6 +793,7 @@ class TaskAllocatorLNS2(TaskAllocatorLNS):
         best_sol = {r: sched.clone() for r, sched in current_sol.items()}
         best_cost = self._evaluate_makespan(best_sol)
         current_cost = best_cost
+        self.history.append((0.0, best_cost))
         
         # SA Parameters
         temperature = 50.0 
@@ -834,11 +841,12 @@ class TaskAllocatorLNS2(TaskAllocatorLNS):
                 if current_cost < best_cost:
                     best_sol = {r: sched.clone() for r, sched in current_sol.items()}
                     best_cost = current_cost
+                    self.history.append((time.time() - start_time, best_cost))
             
             temperature *= cooling_rate
 
         print(f"LNS2 Finished: Best Cost {best_cost:.2f} | Iterations: {iterations} | Evals: {self.eval_count}")
-        return {r: sched.tasks for r, sched in best_sol.items()}
+        return {r: sched.tasks for r, sched in best_sol.items()}, self.history
 
     def _intensify_solution(self, solution):
         for r_name, sched in solution.items():
@@ -1097,7 +1105,7 @@ class TaskAllocatorLNS3(TaskAllocatorLNS2):
     3. Noise Injection (Prevents Cycles)
     """
     
-    def solve(self, time_limit: float = 2.0) -> Dict[str, List[DeliveryTask]]:
+    def solve(self, time_limit: float = 2.0) -> Tuple[Dict[str, List[DeliveryTask]], List[Tuple[float, float]]]:
         print(f"--- Running Hybrid LNS3 (Time Limit: {time_limit}s) ---")
         start_time = time.time()
         
@@ -1110,6 +1118,7 @@ class TaskAllocatorLNS3(TaskAllocatorLNS2):
         best_sol = {r: sched.clone() for r, sched in current_sol.items()}
         best_cost = self._evaluate_makespan(best_sol)
         current_cost = best_cost
+        self.history.append((0.0, best_cost))
         
         temperature = 50.0 
         cooling_rate = 0.98 
@@ -1154,11 +1163,12 @@ class TaskAllocatorLNS3(TaskAllocatorLNS2):
                 if current_cost < best_cost:
                     best_sol = {r: sched.clone() for r, sched in current_sol.items()}
                     best_cost = current_cost
+                    self.history.append((time.time() - start_time, best_cost))
             
             temperature *= cooling_rate
 
         print(f"LNS3 Finished: Best Cost {best_cost:.2f} | Iterations: {iterations} | Evals: {self.eval_count}")
-        return {r: sched.tasks for r, sched in best_sol.items()}
+        return {r: sched.tasks for r, sched in best_sol.items()}, self.history
 
     def _destroy_spatial(self, solution, n):
         """
@@ -1218,9 +1228,10 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         # [IMPROVEMENT] Exploration Bias:
         # Start with 1.5/1.0 (~60/40 split) to match LNS2's optimal strategy.
         self.scores = {
-            'random': 1.5,
-            'worst': 1.0,
-            'spatial': 0.1 
+            'random': 1.0,   # Was 1.5
+            'worst': 2.0,    # Was 1.0
+            'spatial': 0.1,  # Was 0.1
+            'critical': 3.0  # Was 2.0
         }
         self.usage_counts = {k: 0 for k in self.scores}
         
@@ -1232,7 +1243,7 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         
         self.decay = 0.95   # Smoothing factor for weights
         
-    def solve(self, time_limit: float = 2.0) -> Dict[str, List[DeliveryTask]]:
+    def solve(self, time_limit: float = 2.0) -> Tuple[Dict[str, List[DeliveryTask]], List[Dict[str, Any]]]:
         print(f"--- Running ALNS (Time Limit: {time_limit}s) ---")
         start_time = time.time()
         
@@ -1248,34 +1259,45 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         best_cost = self._evaluate_makespan(best_sol)
         current_cost = best_cost
         
+        telemetry_log = []
+        
         # [IMPROVEMENT] Dynamic Temperature
-        # Start HOT (min 50.0) to match LNS2's ability to escape local optima.
         temperature = max(50.0, current_cost * 0.5)
+        start_temp = temperature
+        
         cooling_rate = 0.98 
         iterations = 0
+        stagnation_threshold = 300 # Was 100 
         
         n_tasks = len(self.goals)
         min_rem = 1
         max_rem = max(1, min(4, int(n_tasks * 0.4)))
         
         # [IMPROVEMENT] Complexity Matching
-        # For small problems (< 10 goals), Spatial destruction is mathematically 
-        # equivalent to Random but slower. Disable it to match LNS2's speed.
         if n_tasks < 10:
             self.scores['spatial'] = 0.0
             
         iterations_since_improvement = 0
+        force_kick = False # For massive destroy
+        force_nuclear = False # For nuclear destroy
+        reheat_count = 0
         
         # ALNS Loop
         while (time.time() - start_time) < time_limit:
             iterations += 1
             
             # [IMPROVEMENT] Variable Neighborhood Size (VND)
-            # SOTA Technique: Scale destruction based on stagnation.
-            # - High improvement rate? Use small N=1 for speed/polishing.
-            # - Stuck? Gradually increase N to break out (Diversification).
-            base_n = 1 + int(iterations_since_improvement / 20) ##########!!!!!!!!!!!!!!!!!!!!############ 100 vs 20
-            n_remove = min(max_rem, base_n)
+            if force_nuclear:
+                n_remove = int(n_tasks * 0.7) # Nuclear kick
+                force_nuclear = False
+                force_kick = False
+            elif force_kick:
+                n_remove = int(n_tasks * 0.5) # Massive kick
+                force_kick = False
+            else:
+                base_n = 1 + int(iterations_since_improvement / 50)  # was 20!
+                # n_remove = min(max_rem, base_n)
+                n_remove = min(4, 1 + base_n)
             
             # A. Select Operator
             op_name = self._select_operator()
@@ -1293,10 +1315,10 @@ class TaskAllocatorALNS(TaskAllocatorBase):
                 temp_sol, removed_tasks = self._destroy_worst(temp_sol, n_remove)
             elif op_name == 'spatial':
                 temp_sol, removed_tasks = self._destroy_spatial(temp_sol, n_remove)
+            elif op_name == 'critical':
+                temp_sol, removed_tasks = self._destroy_critical(temp_sol, n_remove)
             
             # D. Repair
-            # Scale noise with temperature: High T -> High Noise (Exploration)
-            # Low T -> Low Noise (Precision)
             current_noise = 0.2 * (temperature / 50.0)
             temp_sol = self._repair_regret_noise(temp_sol, removed_tasks, noise_level=current_noise)
             
@@ -1310,19 +1332,24 @@ class TaskAllocatorALNS(TaskAllocatorBase):
             delta = new_cost - current_cost
             accepted = False
             reward = self.sigma_4
+            outcome_code = 0 # 0=Reject
             
             if delta < 0:
                 accepted = True
                 if new_cost < best_cost:
+                    outcome_code = 3 # Global Best
                     reward = self.sigma_1
                     best_sol = {r: sched.clone() for r, sched in temp_sol.items()}
                     best_cost = new_cost
-                    iterations_since_improvement = 0 # Reset VND (Focus on polishing this new best)
+                    iterations_since_improvement = 0 
+                    reheat_count = 0 # Reset on success
                 else:
+                    outcome_code = 2 # Improved Local
                     reward = self.sigma_2
                     iterations_since_improvement += 1
             elif random.random() < math.exp(-delta / max(temperature, 1e-5)):
                 accepted = True
+                outcome_code = 1 # Accepted Worse
                 reward = self.sigma_3
                 iterations_since_improvement += 1
             else:
@@ -1332,10 +1359,49 @@ class TaskAllocatorALNS(TaskAllocatorBase):
                 current_sol = temp_sol
                 current_cost = new_cost
             
+            # --- LOGGING ---
+            times_list = [self._calculate_schedule_duration(r, current_sol[r].tasks) for r in self.robots]
+            imbalance = max(times_list) - min(times_list) if times_list else 0
+            
+            reheat_flag = 0
+            # --- THE FIX: REHEATING LOGIC ---
+            if iterations_since_improvement > stagnation_threshold:
+                # print(f"  >> STAGNATION DETECTED (Iter {iterations}) >> REHEATING!")
+                temperature = start_temp * 0.75 # Was 0.5
+                current_sol = {r: sched.clone() for r, sched in best_sol.items()}
+                current_cost = best_cost
+                iterations_since_improvement = 0
+                reheat_flag = 1
+                reheat_count += 1
+                
+                if reheat_count > 1:
+                    force_nuclear = True
+                else:
+                    force_kick = True # Trigger massive destroy next iter
+            
+            log_entry = {
+                "time": time.time() - start_time,
+                "iter": iterations,
+                "temp": temperature,
+                "best_cost": best_cost,
+                "curr_cost": current_cost,
+                "operator": op_name,
+                "outcome": outcome_code,
+                "imbalance": imbalance,
+                "reheat": reheat_flag
+            }
+            telemetry_log.append(log_entry)
+            
             # H. Update Weights
             self._update_weight(op_name, reward)
             
             temperature *= cooling_rate
+            
+            # Safety floor
+            if temperature < 0.01: 
+                temperature = start_temp * 0.1
+            # temperature *= cooling_rate
+            # if temperature < 0.5: temperature = 0.5 # Keep it simmering
 
         # Print Statistics
         print(f"ALNS Finished: Best Cost {best_cost:.2f} | Iterations: {iterations}")
@@ -1345,7 +1411,7 @@ class TaskAllocatorALNS(TaskAllocatorBase):
         # [DEBUG] Print Detailed Kinematics
         self._print_schedule_debug(best_sol)
         
-        return {r: sched.tasks for r, sched in best_sol.items()}
+        return {r: sched.tasks for r, sched in best_sol.items()}, telemetry_log
 
     def _select_operator(self):
         """Roulette Wheel Selection based on weights."""
@@ -1372,6 +1438,33 @@ class TaskAllocatorALNS(TaskAllocatorBase):
             self.scores['random'] = max(0.6, self.scores['random'])
         elif op_name == 'worst':
             self.scores['worst'] = max(0.4, self.scores['worst'])
+
+    def _destroy_critical(self, solution, n):
+        """Removes tasks specifically from the bottleneck robot."""
+        # 1. Find the bottleneck robot
+        max_time = -1
+        worst_robot = None
+        
+        for r, sched in solution.items():
+            t = self._calculate_schedule_duration(r, sched.tasks)
+            if t > max_time:
+                max_time = t
+                worst_robot = r
+        
+        # Safety check
+        if not worst_robot or not solution[worst_robot].tasks:
+            return self._destroy_random(solution, n) 
+            
+        # 2. Remove N random tasks ONLY from this robot
+        sched = solution[worst_robot]
+        k = min(n, len(sched.tasks))
+        removed_tasks = []
+        
+        for _ in range(k):
+            t = sched.tasks.pop(random.randint(0, len(sched.tasks)-1))
+            removed_tasks.append(t)
+            
+        return solution, removed_tasks
 
     # --- 1. DESTROY OPERATORS ---
     

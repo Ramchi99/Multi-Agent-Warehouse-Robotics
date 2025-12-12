@@ -112,7 +112,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.min_sample_dist = 0.3  # Minimum distance between nodes # 0.3
         self.turn_penalty = 0.0  # Heuristic cost for "stopping and turning" (meters equivalent)
 
-        self.time_limit = 15.0  # Time limit for task allocation # 10.0
+        self.time_limit = 10.0  # Time limit for task allocation # 10.0
 
         self.seed = 42
 
@@ -199,35 +199,44 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             "goals": goals_list,
             "collections": collections_list,
         }
-
+        
+        # Setup Output
+        out_dir = Path("out/ex14/debug_plots")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
         # A. Run SA
         allocator_sa = TaskAllocatorSA(**alloc_args)
-        # Give SA 30% of time or a fixed amount
-        sa_assignments = allocator_sa.solve(time_limit=self.time_limit)
+        sa_assignments, sa_hist = allocator_sa.solve(time_limit=self.time_limit)
         sa_cost = allocator_sa._evaluate_makespan({r: RobotSchedule(r, t) for r, t in sa_assignments.items()})
 
         # B. Run LNS
         allocator_lns = TaskAllocatorLNS(**alloc_args)
-        # Give LNS more time as it's the primary target
-        lns_assignments = allocator_lns.solve(time_limit=self.time_limit)
+        lns_assignments, lns_hist = allocator_lns.solve(time_limit=self.time_limit)
         lns_cost = allocator_lns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns_assignments.items()})
 
         # C. Run LNS2
         allocator_lns2 = TaskAllocatorLNS2(**alloc_args)
-        # Give LNS more time as it's the primary target
-        lns2_assignments = allocator_lns2.solve(time_limit=self.time_limit)
+        lns2_assignments, lns2_hist = allocator_lns2.solve(time_limit=self.time_limit)
         lns2_cost = allocator_lns2._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns2_assignments.items()})
 
         # D. Run LNS3
         allocator_lns3 = TaskAllocatorLNS3(**alloc_args)
-        # Give LNS more time as it's the primary target
-        lns3_assignments = allocator_lns3.solve(time_limit=self.time_limit)
+        lns3_assignments, lns3_hist = allocator_lns3.solve(time_limit=self.time_limit)
         lns3_cost = allocator_lns3._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns3_assignments.items()})
 
         # E. Run ALNS (Adaptive)
         allocator_alns = TaskAllocatorALNS(**alloc_args)
-        alns_assignments = allocator_alns.solve(time_limit=self.time_limit)
+        alns_assignments, alns_telemetry = allocator_alns.solve(time_limit=self.time_limit)
         alns_cost = allocator_alns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in alns_assignments.items()})
+        
+        # Telemetry Processing
+        alns_hist = [(entry['time'], entry['best_cost']) for entry in alns_telemetry]
+        
+        import json
+        telemetry_file = out_dir / f"alns_telemetry_{timestamp}.json"
+        with open(telemetry_file, 'w') as f:
+            json.dump(alns_telemetry, f, indent=2)
 
         # --- ALLOCATOR COMPARISON & SELECTION ---
         print(f"--- RESULT COMPARISON (Theoretical) ---")
@@ -314,7 +323,15 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         out_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # --- 11. PLOT WINNER ---
+        # --- 11. PLOT CONVERGENCE ---
+        histories = {
+            "SA": sa_hist, "LNS": lns_hist, 
+            "LNS2": lns2_hist, "LNS3": lns3_hist, "ALNS": alns_hist
+        }
+        conv_filename = out_dir / f"allocator_convergence_{timestamp}.png"
+        self._plot_convergence(histories, str(conv_filename))
+
+        # --- 12. PLOT EXECUTION FOR ALL ---
         for name, (d_paths, d_waits) in plot_data.items():
             st_planner.debug_paths = d_paths
             st_planner.debug_waits = d_waits
@@ -337,6 +354,11 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         global_plan_message = GlobalPlanMessage(
             paths=paths_output_xy
         )
+        
+        # --- Plot Winner PRM with Paths ---
+        filename_prm = out_dir / f"prm_debug_{timestamp}_{best_candidate_name}.png"
+        self._plot_prm(G, obs_polygons, special_nodes_plot, str(filename_prm), bounds, path_data, final_paths=paths_output_xy)
+        
         return global_plan_message.model_dump_json(round_trip=True)
 
     def _find_path_coords(self, path_data, src, dst):
@@ -857,3 +879,40 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         analyze_schedule("SA SOLUTION", sa_assignments)
         analyze_schedule("LNS SOLUTION", lns_assignments)
         print("=" * 80 + "\n")
+
+    def _plot_convergence(self, histories, filename):
+        plt.figure(figsize=(12, 8))
+        
+        # Determine global max time to extend plots to the right edge
+        global_max_t = 0.0
+        for h in histories.values():
+            if h: global_max_t = max(global_max_t, h[-1][0])
+        # Add a small buffer or assume time_limit was ~global_max_t
+        global_max_t = max(global_max_t, 0.1)
+
+        for name, history in histories.items():
+            if not history: continue
+            history.sort(key=lambda x: x[0])
+            
+            times = [t for t, c in history]
+            costs = [c for t, c in history]
+            
+            # Extend the line to the global max time for visual comparison
+            if times[-1] < global_max_t:
+                times.append(global_max_t)
+                costs.append(costs[-1])
+            
+            # Plot
+            final_c = costs[-1]
+            plt.step(times, costs, where='post', label=f"{name} ({final_c:.2f})", linewidth=2.5, alpha=0.8)
+            plt.plot(times, costs, 'o', markersize=5, alpha=0.6) # Mark improvements
+            
+        plt.xlabel("Computation Time (s)", fontsize=12)
+        plt.ylabel("Theoretical Cost", fontsize=12)
+        plt.title("Optimization Convergence Profile", fontsize=14)
+        plt.legend(fontsize=10, loc='best')
+        plt.grid(True, which="both", linestyle='--', alpha=0.5)
+        plt.minorticks_on()
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
