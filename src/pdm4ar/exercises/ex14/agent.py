@@ -42,7 +42,9 @@ from .task_allocator import (
     TaskAllocatorALNS,
 )
 from .spacetime_planner import SpaceTimeRoadmapPlanner
-from .spacetime_planner_FF import SpaceTimePlannerFF # [NEW]
+from .spacetime_planner_FF import SpaceTimePlannerFF
+from .exact_spacetime_planner import ExactSpaceTimePlanner, PlanPoint
+from dg_commons.sim.models.diff_drive import DiffDriveState
 
 
 class GlobalPlanMessage(BaseModel):
@@ -133,87 +135,61 @@ class Pdm4arAgent(Agent):
         Pure Feedforward Controller (Player Piano).
         Executes the exact FF plan step-by-step based on grid time.
         """
+        # 1. Safety Check: If no plan, do nothing
         if not self.my_global_path:
             return DiffDriveCommands(omega_l=0.0, omega_r=0.0)
 
         current_time = float(sim_obs.time)
-        current_state = sim_obs.players[self.name].state
-        x, y, theta = current_state.x, current_state.y, current_state.psi
-
-        # [OPTION 1] Linear Interpolation + Feedback (Commented Out)
-        # ---------------------------------------------------------
-        # while (self.current_path_idx < len(self.my_global_path) - 1 and 
-        #        self.my_global_path[self.current_path_idx + 1][3] <= current_time):
-        #     self.current_path_idx += 1
-        #     
-        # p0 = self.my_global_path[self.current_path_idx]
-        # rx, ry, rtheta, t0, rv, rw = p0
-        # 
-        # if self.current_path_idx < len(self.my_global_path) - 1:
-        #     p1 = self.my_global_path[self.current_path_idx + 1]
-        #     t1 = p1[3]
-        #     dt = t1 - t0
-        #     if dt > 1e-6:
-        #         alpha = (current_time - t0) / dt
-        #         alpha = max(0.0, min(1.0, alpha))
-        #         rx = p0[0] + alpha * (p1[0] - p0[0])
-        #         ry = p0[1] + alpha * (p1[1] - p0[1])
-        #         d_theta = (p1[2] - p0[2] + math.pi) % (2*math.pi) - math.pi
-        #         rtheta = (p0[2] + alpha * d_theta + math.pi) % (2*math.pi) - math.pi
-        #         rv = p0[4]
-        #         rw = p0[5]
-        # 
-        # v_cmd = rv
-        # w_cmd = rw
-        # if not (abs(rv) < 1e-3 and abs(rw) < 1e-3):
-        #      dx = rx - x
-        #      dy = ry - y
-        #      ex = math.cos(theta) * dx + math.sin(theta) * dy
-        #      heading_error = (rtheta - theta + math.pi) % (2*math.pi) - math.pi
-        #      v_cmd += self.params.k_x * ex
-        #      w_cmd += self.params.k_theta * heading_error
-        # ---------------------------------------------------------
-
-        # [OPTION 2] Grid-Based Feedforward (Player Piano) - ACTIVE
-        # ---------------------------------------------------------
-        # Grid-Based Lookup
-        # Round to nearest 0.1s step
-        step_idx = int(round(current_time / 0.1))
+        dt = 0.1
         
-        rv, rw = 0.0, 0.0
-        # Position reference: where we should be NOW (step_idx)
-        if step_idx < len(self.my_global_path):
-            pt = self.my_global_path[step_idx]
-            rx, ry, rtheta = pt[0], pt[1], pt[2]
+        # 2. Determine Time Step (THE FIX)
+        # We use INT (floor) to stay in the current step for the full 0.1s.
+        # We add a tiny epsilon (1e-5) to handle floating point imprecision 
+        # (e.g., if t=0.1999999, we want index 1).
+        step_idx = int((current_time + 1e-5) / dt)
+        
+        # 3. Look Ahead
+        # The plan at index 'i' tells us the state at t=(i+1)*dt and the command used to GET there
+        # (i.e., the command for the interval [i*dt, (i+1)*dt]).
+        # So for the current time t (falling in step_idx), we need the command stored at index 'step_idx'.
+        lookahead_idx = step_idx
+
+        v_cmd = 0.0
+        w_cmd = 0.0
+        
+        # Debugging variables for logging
+        rx, ry, rtheta = 0.0, 0.0, 0.0
+
+        if lookahead_idx < len(self.my_global_path):
+            next_pt = self.my_global_path[lookahead_idx]
+            
+            # Tuple structure: (x, y, theta, t, v, w)
+            rx, ry, rtheta = next_pt[0], next_pt[1], next_pt[2]
+            v_cmd = next_pt[4]
+            w_cmd = next_pt[5]
         else:
+            # End of path reached or exceeded
             if self.my_global_path:
                 last = self.my_global_path[-1]
                 rx, ry, rtheta = last[0], last[1], last[2]
-            else:
-                rx, ry, rtheta = x, y, theta
+            v_cmd = 0.0
+            w_cmd = 0.0
 
-        # Command reference: what we should do for the NEXT interval (step_idx + 1)
-        # The stored velocity at i is "how we got to i".
-        # So to get to i+1, we need the velocity stored at i+1.
-        cmd_idx = step_idx + 1
-        if cmd_idx < len(self.my_global_path):
-            next_pt = self.my_global_path[cmd_idx]
-            rv, rw = next_pt[4], next_pt[5]
-        else:
-            rv, rw = 0.0, 0.0
-
-        # Control Law: Pure Feedforward
-        v_cmd = rv
-        w_cmd = rw
-        # ---------------------------------------------------------
-
-        # 4. Wheel Commands
+        # 4. Inverse Kinematics (Convert v, w -> omega_l, omega_r)
         r = self.sg.wheelradius
         L = self.sg.wheelbase
+        
+        # Standard differential drive equations:
+        # v = r/2 * (wr + wl)
+        # w = r/L * (wr - wl)
         omega_r = (v_cmd + (L / 2) * w_cmd) / r
         omega_l = (v_cmd - (L / 2) * w_cmd) / r
         
-        # [NEW] Calculate Actual Velocities (Numerical Differentiation)
+        # --- 5. LOGGING & METRICS (Optional but recommended) ---
+        current_state = sim_obs.players[self.name].state
+        x, y, theta = current_state.x, current_state.y, current_state.psi
+        
+        # Calculate Actual Velocities (Numerical Differentiation)
         v_act, w_act = 0.0, 0.0
         if self.prev_state is not None:
             dt_sim = current_time - self.prev_time
@@ -221,8 +197,11 @@ class Pdm4arAgent(Agent):
                 dx_act = x - self.prev_state[0]
                 dy_act = y - self.prev_state[1]
                 dtheta_act = (theta - self.prev_state[2] + math.pi) % (2*math.pi) - math.pi
+                
                 v_act = math.sqrt(dx_act**2 + dy_act**2) / dt_sim
                 move_angle = math.atan2(dy_act, dx_act)
+                
+                # Check for reverse motion to sign v_act correctly
                 if abs(v_act) > 0.01:
                     heading_diff = (move_angle - self.prev_state[2] + math.pi) % (2*math.pi) - math.pi
                     if abs(heading_diff) > math.pi/2:
@@ -232,11 +211,19 @@ class Pdm4arAgent(Agent):
         self.prev_state = (x, y, theta)
         self.prev_time = current_time
         
-        # [NEW] Logging
+        # Write to CSV
         try:
             with open(self.log_file, 'a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow([current_time, omega_l, omega_r, rv, rw, v_cmd, w_cmd, x, y, theta, rx, ry, rtheta, v_act, w_act])
+                writer.writerow([
+                    current_time, 
+                    omega_l, omega_r, 
+                    v_cmd, w_cmd,       # Reference commands
+                    v_cmd, w_cmd,       # (Duplicate for compatibility with your header)
+                    x, y, theta,        # Actual State
+                    rx, ry, rtheta,     # Reference State
+                    v_act, w_act        # Actual Velocities
+                ])
         except Exception:
             pass 
 
@@ -413,190 +400,112 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             cost = allocator_alns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in sol.items()})
             candidates.append((f"ALNS_{i+1}", sol, cost))
 
-        # ---------------------------------------------------------------------
-        # --- 10. SPACE-TIME EXECUTION PLANNING (SIMULATION) ---
-        # ---------------------------------------------------------------------
-        print("\n>> Running Space-Time Simulation for ALL candidates...")
+        # --- SELECT WINNER ---
+        # We select the candidate with the lowest Theoretical Cost
+        # candidates is a list of tuples: (name, assignments, cost)
+        best_candidate_name, best_assign, best_cost = min(candidates, key=lambda x: x[2])
 
-        # A. Setup Planner (Shared)
-        v_max, w_max = self._get_kinematic_limits(sg, sp)
+        # ---------------------------------------------------------------------
+        # --- 10. EXACT SPACE-TIME EXECUTION (The "Winner" Only) ---
+        # ---------------------------------------------------------------------
+        print(f"\n>> Running Exact Physics Simulation for Winner: {best_candidate_name}")
 
-        # [OLD] Kinematic Heuristic Planner
-        # st_planner = SpaceTimeRoadmapPlanner(
-        #     prm_graph=G,
-        #     robot_radius=self.robot_radius,
-        #     v_max=v_max,
-        #     w_max=w_max,
-        #     dt_search=0.1,  # High precision
-        #     use_prm=False,  # Tunnel-Path Only
-        # )
+        # 1. Prepare Waypoints for the Winner
+        # We need to convert the 'best_assign' (Tasks) into 'robot_waypoints' (X,Y Coordinates)
+        robot_waypoints = {}
         
-        # [NEW] Exact Physics Feedforward Planner
-        st_planner = SpaceTimePlannerFF(
-            prm_graph=G,
-            sg=sg, 
-            sp=sp,
-            dt=0.1,
-            use_prm=False
+        # We also need to gather the robot parameters for the simulator
+        geometries = {}
+        params = {}
+        initial_states_obj = {}
+
+        # Iterate through the assignments of the winning allocator (SA, LNS, etc.)
+        for r_name, tasks in best_assign.items():
+            
+            # A. Collect Robot Physics Data from Observations
+            # We access the observations directly to get the correct wheel radius, limits, etc.
+            p_obs = init_sim_obs.players_obs[r_name]
+            geometries[r_name] = p_obs.model_geometry
+            params[r_name] = p_obs.model_params
+            # initial_states_obj[r_name] = init_sim_obs.initial_states[r_name]
+
+            # [THE FIX IS HERE] -----------------------------------------
+            # Do not use: initial_states_obj[r_name] = init_sim_obs.initial_states[r_name]
+            # Instead, create a FRESH object using raw floats:
+            raw_s = init_sim_obs.initial_states[r_name]
+            
+            s_clean = DiffDriveState(
+                x=float(raw_s.x),
+                y=float(raw_s.y),
+                psi=float(raw_s.psi) # This forces psi=1.0
+            )
+            print(f"DEBUG: Cleaned State for {r_name}: x={s_clean.x}, y={s_clean.y}, psi={s_clean.psi}")
+            initial_states_obj[r_name] = s_clean
+            # -----------------------------------------------------------
+
+            # DEBUG: Print what the planner sees vs what the config says
+            s = initial_states_obj[r_name]
+            print(f"DEBUG: Planner Init State for {r_name}: x={s.x}, y={s.y}, psi={s.psi}")
+
+            # B. Build the list of geometric waypoints
+            wps = []
+            curr_node = r_name # The robot starts at its own named node (Start Node)
+
+            for task in tasks:
+                # Part 1: Path from Current Node -> Goal Node
+                segment_coords = self._find_path_coords_raw(path_data, curr_node, task.goal_id)
+                if segment_coords:
+                    # We extend the list with these points. 
+                    # segment_coords includes the start point, so we might want to skip it 
+                    # to avoid duplicate points, but the planner handles distance=0 gracefully.
+                    # We skip [0] to be clean.
+                    wps.extend(segment_coords[1:])
+                
+                curr_node = task.goal_id
+
+                # Part 2: Path from Goal Node -> Collection Node
+                segment_coords = self._find_path_coords_raw(path_data, curr_node, task.collection_id)
+                if segment_coords:
+                    wps.extend(segment_coords[1:])
+                
+                curr_node = task.collection_id
+            
+            # [NEW] Return to Start (Vacate Collection Point)
+            # After finishing all tasks, navigate back to the initial start node.
+            segment_coords = self._find_path_coords_raw(path_data, curr_node, r_name)
+            if segment_coords:
+                wps.extend(segment_coords[1:])
+            
+            robot_waypoints[r_name] = wps
+
+        # 2. Initialize the Exact Planner
+        # We grab the raw static obstacle polygons from the scenario
+        static_obs_polys = []
+        if init_sim_obs.dg_scenario and init_sim_obs.dg_scenario.static_obstacles:
+            static_obs_polys = [o.shape for o in init_sim_obs.dg_scenario.static_obstacles]
+        
+        exact_planner = ExactSpaceTimePlanner(static_obstacles=static_obs_polys, dt=0.1)
+
+        # 3. Run the Planner
+        # We sort robots simply to ensure deterministic order (or you could prioritize them)
+        sorted_robots = sorted(list(best_assign.keys()))
+        
+        final_plans_6d = exact_planner.plan_prioritized(
+            robots_sequence=sorted_robots,
+            initial_states=initial_states_obj,
+            waypoints_dict=robot_waypoints,
+            geometries=geometries,
+            params=params
         )
 
-        # B. Prepare States
-        initial_poses = {name: (s.x, s.y, s.psi) for name, s in init_sim_obs.initial_states.items()}
-
-        best_candidate_name = None
-        best_score = (float("inf"), float("inf"))  # (Failures, Makespan)
-        best_timed_plans = None
-        best_assign = None # [NEW]
-        plot_data = {}
-
-        print(f"{'Allocator':<10} | {'Theor. Cost':<12} | {'Failures':<10} | {'Sim. Makespan':<15}")
-        print("-" * 60)
-
-        for name, assign, theor_cost in candidates:
-            # Clone assignment to avoid side effects (adding return tasks)
-            sim_assign = copy.deepcopy(assign)
-            for r_name in sim_assign:
-                return_task = DeliveryTask(goal_id=r_name, collection_id=r_name)
-                sim_assign[r_name].append(return_task)
-
-            # Run Planning
-            timed_plans, mission_times, failure_count = st_planner.plan_prioritized(
-                assignments=sim_assign, path_data=path_data, initial_states=initial_poses
-            )
-
-            # Store Visualization Data
-            plot_data[name] = (copy.deepcopy(st_planner.debug_paths), copy.deepcopy(st_planner.debug_waits))
-
-            # Calculate Simulated Makespan
-            sim_makespan = 0.0
-            if mission_times:
-                sim_makespan = max(mission_times.values())
-
-            print(f"{name:<10} | {theor_cost:<12.2f} | {failure_count:<10} | {sim_makespan:<15.2f}")
-
-            current_score = (failure_count, sim_makespan)
-            if current_score < best_score:
-                best_score = current_score
-                best_candidate_name = name
-                best_timed_plans = timed_plans
-                best_assign = assign # [NEW] Save original assignment
-
-        print(f"\n>>> WINNER: {best_candidate_name} (Failures: {best_score[0]}, Makespan: {best_score[1]:.2f}s) <<<\n")
-        
-        # --- [NEW] PRINT SPARSE GEOMETRIC PATH & TIMING ---
-        print("="*60)
-        print(f"SPARSE GEOMETRIC PATH & TIMING ({best_candidate_name})")
-        print("="*60)
-        
-        if best_assign and best_timed_plans:
-            for r_name in sorted(best_assign.keys()):
-                tasks = best_assign[r_name]
-                traj_points = best_timed_plans[r_name]
-                
-                # Helper to find approximate time (Arrival and Departure)
-                last_idx = 0
-                def get_t_str(target_x, target_y):
-                    nonlocal last_idx
-                    t_in = -1.0
-                    
-                    # 1. Find Arrival (First point close to target)
-                    for k in range(last_idx, len(traj_points)):
-                        pt = traj_points[k]
-                        if math.hypot(pt.x - target_x, pt.y - target_y) < 0.1:
-                            t_in = pt.t
-                            last_idx = k
-                            break
-                    
-                    if t_in < 0: return " [?]"
-                    
-                    # 2. Find Departure (First point moving AWAY)
-                    t_out = t_in
-                    for k in range(last_idx, len(traj_points)):
-                        pt = traj_points[k]
-                        if math.hypot(pt.x - target_x, pt.y - target_y) > 0.15:
-                            t_out = traj_points[k-1].t
-                            last_idx = k
-                            break
-                    else:
-                        t_out = traj_points[-1].t
-                        last_idx = len(traj_points)
-                    
-                    if abs(t_out - t_in) < 0.15:
-                        return f" [t={t_in:.1f}s]" 
-                    else:
-                        return f" [Arr:{t_in:.1f}s|Dep:{t_out:.1f}s]"
-
-                full_str = [f"Robot {r_name} Start"]
-                start_x, start_y, start_psi = initial_poses[r_name]
-                full_str.append(f"({start_x:.2f}, {start_y:.2f}, h={start_psi:.2f}) [t=0.0s]")
-                
-                curr = r_name
-                
-                def get_raw_coords(u, v):
-                    for cat in path_data.values():
-                        if u in cat and v in cat[u]: return cat[u][v]['coords']
-                    return []
-
-                for task in tasks:
-                    # 1. To Goal
-                    coords = get_raw_coords(curr, task.goal_id)
-                    if coords:
-                        for x, y in coords[1:]:
-                            full_str.append(f"-> ({x:.2f}, {y:.2f}){get_t_str(x, y)}")
-                    
-                    full_str.append(f"-> [{task.goal_id}]")
-                    curr = task.goal_id
-                    
-                    # 2. To Collection
-                    coords = get_raw_coords(curr, task.collection_id)
-                    if coords:
-                        for x, y in coords[1:]:
-                            full_str.append(f"-> ({x:.2f}, {y:.2f}){get_t_str(x, y)}")
-                            
-                    full_str.append(f"-> [{task.collection_id}]")
-                    curr = task.collection_id
-                    
-                print(" ".join(full_str))
-        print("="*60 + "\n")
-
-        # --- PLOTTING SETUP ---
-        out_dir = Path("out/ex14/debug_plots")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # --- 11. PLOT CONVERGENCE ---
-        histories = {"SA": sa_hist, "LNS": lns_hist, "LNS2": lns2_hist, "LNS3": lns3_hist, "ALNS": alns_hist}
-        conv_filename = out_dir / f"allocator_convergence_{timestamp}.png"
-        self._plot_convergence(histories, str(conv_filename))
-
-        # --- 12. PLOT EXECUTION FOR ALL ---
-        for name, (d_paths, d_waits) in plot_data.items():
-            st_planner.debug_paths = d_paths
-            st_planner.debug_waits = d_waits
-
-            filename_exec = out_dir / f"spacetime_exec_{timestamp}_{name}.png"
-            st_planner.plot_execution(
-                filename=str(filename_exec), obstacles=obs_polygons, special_nodes=special_nodes_plot
-            )
-
-        # --- 12. RETURN FINAL PLAN (Winner) ---
-        # paths_output_xy = {}
-        # for r_name, points in best_timed_plans.items():
-        #     if points:
-        #         paths_output_xy[r_name] = [(p.x, p.y) for p in points]
-        #     else:
-        #         paths_output_xy[r_name] = []
-
-        # global_plan_message = GlobalPlanMessage(paths=paths_output_xy)
-        
-        # [NEW] Pack full 6D trajectory (x, y, theta, t, v, w)
+        # 4. Convert to Message Format
+        # We convert the PlanPoint objects into the tuple format required by GlobalPlanMessage
+        # (x, y, theta, t, v, w)
         paths_output_6d = {}
-        for r_name, points in best_timed_plans.items():
-            if points:
-                paths_output_6d[r_name] = [(p.x, p.y, p.theta, p.t, p.v, p.w) for p in points]
-            else:
-                paths_output_6d[r_name] = []
+        for r_name, plan_points in final_plans_6d.items():
+            paths_output_6d[r_name] = [(p.x, p.y, p.theta, p.t, p.v, p.w) for p in plan_points]
 
+        # Create the message
         global_plan_message = GlobalPlanMessage(paths=paths_output_6d)
         
         # Helper for plotting
@@ -606,6 +515,14 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         filename_prm = out_dir / f"prm_debug_{timestamp}_{best_candidate_name}.png"
         self._plot_prm(
             G, obs_polygons, special_nodes_plot, str(filename_prm), bounds, path_data, final_paths=paths_output_xy_plot
+        )
+
+        # [NEW] Debug Plotting
+        self._plot_trajectory_comparison(
+            waypoints_dict=robot_waypoints,
+            final_plans_6d=final_plans_6d,
+            obstacles=static_obs_polys,
+            filename=str(out_dir / f"traj_debug_{timestamp}.png")
         )
 
         return global_plan_message.model_dump_json(round_trip=True)
@@ -765,6 +682,17 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             current_idx = best_next_idx
 
         return smoothed
+    
+    def _find_path_coords_raw(self, path_data, src, dst):
+        """
+        Helper to find the geometric path between two nodes.
+        Checks all categories ('starts', 'goals', 'collections') to find the segment.
+        """
+        for cat in ["starts", "goals", "collections"]:
+            # Check if src exists in this category and if dst is a target of src
+            if src in path_data[cat] and dst in path_data[cat][src]:
+                return path_data[cat][src][dst]["coords"]
+        return []
 
     def _get_kinematic_limits(self, sg: DiffDriveGeometry, sp: DiffDriveParameters) -> Tuple[float, float]:
         """Derives v_max [m/s] and omega_max [rad/s] from robot structures."""
@@ -1056,6 +984,75 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         plt.tight_layout()
         plt.savefig(filename)
         plt.close()
+
+    def _plot_trajectory_comparison(self, waypoints_dict, final_plans_6d, obstacles, filename):
+        """
+        Plots the Raw Waypoints vs the Calculated Physics Trajectory.
+        Robust to different Shapely geometry types (Polygon, LinearRing, etc.)
+        """
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 12))
+        
+        # 1. Plot Obstacles (Robustly)
+        for poly in obstacles:
+            # Handle Multi-geometries (MultiPolygon, GeometryCollection)
+            geoms = poly.geoms if hasattr(poly, "geoms") else [poly]
+            
+            for geom in geoms:
+                try:
+                    if geom.geom_type == 'Polygon':
+                        # Polygons have an exterior
+                        x, y = geom.exterior.xy
+                        plt.fill(x, y, color="gray", alpha=0.5, label="Obstacle" if "Obstacle" not in plt.gca().get_legend_handles_labels()[1] else "")
+                    elif geom.geom_type in ['LinearRing', 'LineString']:
+                        # LinearRings are just lines (no exterior attribute)
+                        x, y = geom.xy
+                        plt.plot(x, y, color="gray", linewidth=2, alpha=0.5, label="Obstacle" if "Obstacle" not in plt.gca().get_legend_handles_labels()[1] else "")
+                    else:
+                        print(f"Warning: Skipping unsupported geometry type: {geom.geom_type}")
+                except Exception as e:
+                    print(f"Error plotting geometry: {e}")
+
+        # 2. Plot Paths per Robot
+        colors = ['red', 'green', 'blue', 'orange', 'purple', 'brown']
+        
+        for i, r_name in enumerate(final_plans_6d.keys()):
+            c = colors[i % len(colors)]
+            
+            # A. Plot Raw Waypoints (The Input)
+            if r_name in waypoints_dict:
+                wps = waypoints_dict[r_name]
+                if wps:
+                    wx, wy = zip(*wps)
+                    plt.plot(wx, wy, color=c, marker='x', linestyle='--', linewidth=1, markersize=8, alpha=0.5, label=f"{r_name} Raw Input")
+            
+            # B. Plot Calculated Physics Trajectory (The Output)
+            plan = final_plans_6d[r_name]
+            if plan:
+                px = [p.x for p in plan]
+                py = [p.y for p in plan]
+                
+                # Plot the line
+                plt.plot(px, py, color=c, linewidth=2, label=f"{r_name} Physics Plan")
+                
+                # Plot Orientation Arrows (Subsample every ~1s)
+                arrow_step = 10
+                if len(plan) > arrow_step:
+                    quiver_x = px[::arrow_step]
+                    quiver_y = py[::arrow_step]
+                    quiver_u = [math.cos(p.theta) for p in plan[::arrow_step]]
+                    quiver_v = [math.sin(p.theta) for p in plan[::arrow_step]]
+                    
+                    plt.quiver(quiver_x, quiver_y, quiver_u, quiver_v, color=c, scale=20, width=0.003, alpha=0.8)
+
+        plt.title(f"Trajectory Debug: Raw Input vs Physics Plan")
+        plt.legend(loc="upper right")
+        plt.axis("equal")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+        print(f"Generated trajectory comparison plot: {filename}")
 
     def _print_debug_comparison(self, sa_assignments, lns_assignments, cost_matrix, heading_matrix):
         """
