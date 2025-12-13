@@ -2,6 +2,7 @@ import random
 import datetime
 import copy
 import math
+import csv # [NEW]
 from re import A
 import time
 from pathlib import Path
@@ -41,6 +42,7 @@ from .task_allocator import (
     TaskAllocatorALNS,
 )
 from .spacetime_planner import SpaceTimeRoadmapPlanner
+from .spacetime_planner_FF import SpaceTimePlannerFF # [NEW]
 
 
 class GlobalPlanMessage(BaseModel):
@@ -48,12 +50,17 @@ class GlobalPlanMessage(BaseModel):
     # fake_id: int
     # fake_name: str
     # fake_np_data: NDArray # If you need to send numpy arrays, annotate them with NDArray
-    paths: Mapping[str, Sequence[Tuple[float, float]]]
+    # paths: Mapping[str, Sequence[Tuple[float, float]]]
+    # [NEW] Updated to support 6D trajectory: (x, y, theta, t, v, w)
+    paths: Mapping[str, Sequence[Tuple[float, float, float, float, float, float]]]
 
 
 @dataclass(frozen=True)
 class Pdm4arAgentParams:
     param1: float = 10
+    # [NEW] Gains
+    k_x: float = 1.0
+    k_theta: float = 2.0
 
 
 class Pdm4arAgent(Agent):
@@ -70,37 +77,170 @@ class Pdm4arAgent(Agent):
     def __init__(self):
         # feel free to remove/modify  the following
         self.params = Pdm4arAgentParams()
-        # self.my_global_path: List[Tuple[float, float]] = []
+        # [NEW] 6D Trajectory
+        self.my_global_path: List[Tuple[float, float, float, float, float, float]] = []
+        self.current_path_idx = 0
+        self._pending_global_plan_msg = None
+        
+        # Initialize defaults (will be overwritten in on_episode_init)
+        self.sg = DiffDriveGeometry.default()
+        self.sp = DiffDriveParameters.default()
 
     def on_episode_init(self, init_sim_obs: InitSimObservations):
-        pass
+        # [FIX] Get our identity and correct physics from the simulator
+        self.name = init_sim_obs.my_name
+        self.sg = init_sim_obs.model_geometry
+        self.sp = init_sim_obs.model_params
+        
+        self.current_path_idx = 0
+        
+        # [NEW] Setup Logging
+        self.log_file = Path(f"out/ex14/debug_plots/cmd_log_{self.name}.csv")
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.prev_state = None
+        self.prev_time = None
+        
+        with open(self.log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["t", "omega_l", "omega_r", "v_ref", "w_ref", "v_cmd", "w_cmd", "x", "y", "theta", "rx", "ry", "rtheta", "v_act", "w_act"])
+        
+        # Process the plan now that we know who we are
+        if self._pending_global_plan_msg:
+            self._process_global_plan(self._pending_global_plan_msg)
+            self._pending_global_plan_msg = None
+
+    def _process_global_plan(self, serialized_msg: str):
+        global_plan = GlobalPlanMessage.model_validate_json(serialized_msg)
+        if hasattr(self, 'name') and self.name in global_plan.paths:
+             self.my_global_path = list(global_plan.paths[self.name])
+        else:
+             self.my_global_path = []
+        self.current_path_idx = 0
 
     def on_receive_global_plan(
         self,
         serialized_msg: str,
     ):
-        # TODO: process here the received global plan
-        global_plan = GlobalPlanMessage.model_validate_json(serialized_msg)
-        # if self.name in global_plan.paths:
-        #     self.my_global_path = list(global_plan.paths[self.name])
-        # else:
-        #     self.my_global_path = []
+        # If we already know our name, process immediately
+        if hasattr(self, 'name'):
+            self._process_global_plan(serialized_msg)
+        else:
+            # Otherwise, wait until on_episode_init
+            self._pending_global_plan_msg = serialized_msg
 
     def get_commands(self, sim_obs: SimObservations) -> DiffDriveCommands:
-        """This method is called by the simulator every dt_commands seconds (0.1s by default).
-        Do not modify the signature of this method.
-
-        For instance, this is how you can get your current state from the observations:
-        my_current_state: DiffDriveState = sim_obs.players[self.name].state
-        :param sim_obs:
-        :return:
         """
+        Pure Feedforward Controller (Player Piano).
+        Executes the exact FF plan step-by-step based on grid time.
+        """
+        if not self.my_global_path:
+            return DiffDriveCommands(omega_l=0.0, omega_r=0.0)
 
-        # TODO: implement here your planning stack
-        omega1 = random.random() * self.params.param1
-        omega2 = random.random() * self.params.param1
+        current_time = float(sim_obs.time)
+        current_state = sim_obs.players[self.name].state
+        x, y, theta = current_state.x, current_state.y, current_state.psi
 
-        return DiffDriveCommands(omega_l=omega1, omega_r=omega2)
+        # [OPTION 1] Linear Interpolation + Feedback (Commented Out)
+        # ---------------------------------------------------------
+        # while (self.current_path_idx < len(self.my_global_path) - 1 and 
+        #        self.my_global_path[self.current_path_idx + 1][3] <= current_time):
+        #     self.current_path_idx += 1
+        #     
+        # p0 = self.my_global_path[self.current_path_idx]
+        # rx, ry, rtheta, t0, rv, rw = p0
+        # 
+        # if self.current_path_idx < len(self.my_global_path) - 1:
+        #     p1 = self.my_global_path[self.current_path_idx + 1]
+        #     t1 = p1[3]
+        #     dt = t1 - t0
+        #     if dt > 1e-6:
+        #         alpha = (current_time - t0) / dt
+        #         alpha = max(0.0, min(1.0, alpha))
+        #         rx = p0[0] + alpha * (p1[0] - p0[0])
+        #         ry = p0[1] + alpha * (p1[1] - p0[1])
+        #         d_theta = (p1[2] - p0[2] + math.pi) % (2*math.pi) - math.pi
+        #         rtheta = (p0[2] + alpha * d_theta + math.pi) % (2*math.pi) - math.pi
+        #         rv = p0[4]
+        #         rw = p0[5]
+        # 
+        # v_cmd = rv
+        # w_cmd = rw
+        # if not (abs(rv) < 1e-3 and abs(rw) < 1e-3):
+        #      dx = rx - x
+        #      dy = ry - y
+        #      ex = math.cos(theta) * dx + math.sin(theta) * dy
+        #      heading_error = (rtheta - theta + math.pi) % (2*math.pi) - math.pi
+        #      v_cmd += self.params.k_x * ex
+        #      w_cmd += self.params.k_theta * heading_error
+        # ---------------------------------------------------------
+
+        # [OPTION 2] Grid-Based Feedforward (Player Piano) - ACTIVE
+        # ---------------------------------------------------------
+        # Grid-Based Lookup
+        # Round to nearest 0.1s step
+        step_idx = int(round(current_time / 0.1))
+        
+        rv, rw = 0.0, 0.0
+        # Position reference: where we should be NOW (step_idx)
+        if step_idx < len(self.my_global_path):
+            pt = self.my_global_path[step_idx]
+            rx, ry, rtheta = pt[0], pt[1], pt[2]
+        else:
+            if self.my_global_path:
+                last = self.my_global_path[-1]
+                rx, ry, rtheta = last[0], last[1], last[2]
+            else:
+                rx, ry, rtheta = x, y, theta
+
+        # Command reference: what we should do for the NEXT interval (step_idx + 1)
+        # The stored velocity at i is "how we got to i".
+        # So to get to i+1, we need the velocity stored at i+1.
+        cmd_idx = step_idx + 1
+        if cmd_idx < len(self.my_global_path):
+            next_pt = self.my_global_path[cmd_idx]
+            rv, rw = next_pt[4], next_pt[5]
+        else:
+            rv, rw = 0.0, 0.0
+
+        # Control Law: Pure Feedforward
+        v_cmd = rv
+        w_cmd = rw
+        # ---------------------------------------------------------
+
+        # 4. Wheel Commands
+        r = self.sg.wheelradius
+        L = self.sg.wheelbase
+        omega_r = (v_cmd + (L / 2) * w_cmd) / r
+        omega_l = (v_cmd - (L / 2) * w_cmd) / r
+        
+        # [NEW] Calculate Actual Velocities (Numerical Differentiation)
+        v_act, w_act = 0.0, 0.0
+        if self.prev_state is not None:
+            dt_sim = current_time - self.prev_time
+            if dt_sim > 1e-6:
+                dx_act = x - self.prev_state[0]
+                dy_act = y - self.prev_state[1]
+                dtheta_act = (theta - self.prev_state[2] + math.pi) % (2*math.pi) - math.pi
+                v_act = math.sqrt(dx_act**2 + dy_act**2) / dt_sim
+                move_angle = math.atan2(dy_act, dx_act)
+                if abs(v_act) > 0.01:
+                    heading_diff = (move_angle - self.prev_state[2] + math.pi) % (2*math.pi) - math.pi
+                    if abs(heading_diff) > math.pi/2:
+                        v_act = -v_act
+                w_act = dtheta_act / dt_sim
+
+        self.prev_state = (x, y, theta)
+        self.prev_time = current_time
+        
+        # [NEW] Logging
+        try:
+            with open(self.log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([current_time, omega_l, omega_r, rv, rw, v_cmd, w_cmd, x, y, theta, rx, ry, rtheta, v_act, w_act])
+        except Exception:
+            pass 
+
+        return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
 
 
 class Pdm4arGlobalPlanner(GlobalPlanner):
@@ -127,6 +267,9 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
         random.seed(self.seed)
         np.random.seed(self.seed)
+        
+        # [DEBUG] Inspect available global observations
+        print(f"DEBUG: GlobalPlanner init_sim_obs dir: {dir(init_sim_obs)}")
 
         # --- 1. EXTRACT OBSTACLES & BOUNDS (Done once) ---
         obs_polygons = []
@@ -185,16 +328,18 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             initial_headings[name] = state.psi
 
         # 5. Get Kinematics for Allocator
-        sg = DiffDriveGeometry.default()
-        sp = DiffDriveParameters.default()
+        # [FIX] Extract dynamic parameters from the first player observation
+        first_player_obs = next(iter(init_sim_obs.players_obs.values()))
+        sg = first_player_obs.model_geometry
+        sp = first_player_obs.model_params
         _, w_max = self._get_kinematic_limits(sg, sp)
 
         # --- Create STRtree for Smoothing ---
         obstacle_tree = STRtree(inflated_obstacles)
 
         # --- 6. COMPUTE ROUTING DATA (COSTS & PATHS) ---
-        # [MODIFIED] Now passing obstacle data for smoothing
-        cost_matrix, path_data, heading_matrix = self._compute_routing_data(G, obstacle_tree, inflated_obstacles)
+        # [MODIFIED] Now passing obstacle data for smoothing AND physics parameters
+        cost_matrix, path_data, heading_matrix = self._compute_routing_data(G, obstacle_tree, inflated_obstacles, sg, sp)
         print(f"Computed Cost Matrix for {len(cost_matrix)} nodes.")
 
         # 7. Initialize Allocator ARGS
@@ -276,13 +421,23 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # A. Setup Planner (Shared)
         v_max, w_max = self._get_kinematic_limits(sg, sp)
 
-        st_planner = SpaceTimeRoadmapPlanner(
+        # [OLD] Kinematic Heuristic Planner
+        # st_planner = SpaceTimeRoadmapPlanner(
+        #     prm_graph=G,
+        #     robot_radius=self.robot_radius,
+        #     v_max=v_max,
+        #     w_max=w_max,
+        #     dt_search=0.1,  # High precision
+        #     use_prm=False,  # Tunnel-Path Only
+        # )
+        
+        # [NEW] Exact Physics Feedforward Planner
+        st_planner = SpaceTimePlannerFF(
             prm_graph=G,
-            robot_radius=self.robot_radius,
-            v_max=v_max,
-            w_max=w_max,
-            dt_search=0.1,  # High precision
-            use_prm=False,  # Tunnel-Path Only
+            sg=sg, 
+            sp=sp,
+            dt=0.1,
+            use_prm=False
         )
 
         # B. Prepare States
@@ -291,6 +446,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         best_candidate_name = None
         best_score = (float("inf"), float("inf"))  # (Failures, Makespan)
         best_timed_plans = None
+        best_assign = None # [NEW]
         plot_data = {}
 
         print(f"{'Allocator':<10} | {'Theor. Cost':<12} | {'Failures':<10} | {'Sim. Makespan':<15}")
@@ -323,8 +479,85 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 best_score = current_score
                 best_candidate_name = name
                 best_timed_plans = timed_plans
+                best_assign = assign # [NEW] Save original assignment
 
         print(f"\n>>> WINNER: {best_candidate_name} (Failures: {best_score[0]}, Makespan: {best_score[1]:.2f}s) <<<\n")
+        
+        # --- [NEW] PRINT SPARSE GEOMETRIC PATH & TIMING ---
+        print("="*60)
+        print(f"SPARSE GEOMETRIC PATH & TIMING ({best_candidate_name})")
+        print("="*60)
+        
+        if best_assign and best_timed_plans:
+            for r_name in sorted(best_assign.keys()):
+                tasks = best_assign[r_name]
+                traj_points = best_timed_plans[r_name]
+                
+                # Helper to find approximate time (Arrival and Departure)
+                last_idx = 0
+                def get_t_str(target_x, target_y):
+                    nonlocal last_idx
+                    t_in = -1.0
+                    
+                    # 1. Find Arrival (First point close to target)
+                    for k in range(last_idx, len(traj_points)):
+                        pt = traj_points[k]
+                        if math.hypot(pt.x - target_x, pt.y - target_y) < 0.1:
+                            t_in = pt.t
+                            last_idx = k
+                            break
+                    
+                    if t_in < 0: return " [?]"
+                    
+                    # 2. Find Departure (First point moving AWAY)
+                    t_out = t_in
+                    for k in range(last_idx, len(traj_points)):
+                        pt = traj_points[k]
+                        if math.hypot(pt.x - target_x, pt.y - target_y) > 0.15:
+                            t_out = traj_points[k-1].t
+                            last_idx = k
+                            break
+                    else:
+                        t_out = traj_points[-1].t
+                        last_idx = len(traj_points)
+                    
+                    if abs(t_out - t_in) < 0.15:
+                        return f" [t={t_in:.1f}s]" 
+                    else:
+                        return f" [Arr:{t_in:.1f}s|Dep:{t_out:.1f}s]"
+
+                full_str = [f"Robot {r_name} Start"]
+                start_x, start_y, start_psi = initial_poses[r_name]
+                full_str.append(f"({start_x:.2f}, {start_y:.2f}, h={start_psi:.2f}) [t=0.0s]")
+                
+                curr = r_name
+                
+                def get_raw_coords(u, v):
+                    for cat in path_data.values():
+                        if u in cat and v in cat[u]: return cat[u][v]['coords']
+                    return []
+
+                for task in tasks:
+                    # 1. To Goal
+                    coords = get_raw_coords(curr, task.goal_id)
+                    if coords:
+                        for x, y in coords[1:]:
+                            full_str.append(f"-> ({x:.2f}, {y:.2f}){get_t_str(x, y)}")
+                    
+                    full_str.append(f"-> [{task.goal_id}]")
+                    curr = task.goal_id
+                    
+                    # 2. To Collection
+                    coords = get_raw_coords(curr, task.collection_id)
+                    if coords:
+                        for x, y in coords[1:]:
+                            full_str.append(f"-> ({x:.2f}, {y:.2f}){get_t_str(x, y)}")
+                            
+                    full_str.append(f"-> [{task.collection_id}]")
+                    curr = task.collection_id
+                    
+                print(" ".join(full_str))
+        print("="*60 + "\n")
 
         # --- PLOTTING SETUP ---
         out_dir = Path("out/ex14/debug_plots")
@@ -347,19 +580,32 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             )
 
         # --- 12. RETURN FINAL PLAN (Winner) ---
-        paths_output_xy = {}
+        # paths_output_xy = {}
+        # for r_name, points in best_timed_plans.items():
+        #     if points:
+        #         paths_output_xy[r_name] = [(p.x, p.y) for p in points]
+        #     else:
+        #         paths_output_xy[r_name] = []
+
+        # global_plan_message = GlobalPlanMessage(paths=paths_output_xy)
+        
+        # [NEW] Pack full 6D trajectory (x, y, theta, t, v, w)
+        paths_output_6d = {}
         for r_name, points in best_timed_plans.items():
             if points:
-                paths_output_xy[r_name] = [(p.x, p.y) for p in points]
+                paths_output_6d[r_name] = [(p.x, p.y, p.theta, p.t, p.v, p.w) for p in points]
             else:
-                paths_output_xy[r_name] = []
+                paths_output_6d[r_name] = []
 
-        global_plan_message = GlobalPlanMessage(paths=paths_output_xy)
+        global_plan_message = GlobalPlanMessage(paths=paths_output_6d)
+        
+        # Helper for plotting
+        paths_output_xy_plot = {r: [(p[0], p[1]) for p in traj] for r, traj in paths_output_6d.items()}
 
         # --- Plot Winner PRM with Paths ---
         filename_prm = out_dir / f"prm_debug_{timestamp}_{best_candidate_name}.png"
         self._plot_prm(
-            G, obs_polygons, special_nodes_plot, str(filename_prm), bounds, path_data, final_paths=paths_output_xy
+            G, obs_polygons, special_nodes_plot, str(filename_prm), bounds, path_data, final_paths=paths_output_xy_plot
         )
 
         return global_plan_message.model_dump_json(round_trip=True)
@@ -389,7 +635,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             new_coords.append(coords[i + 1])
         return new_coords
 
-    def _compute_routing_data(self, G, obstacle_tree, inflated_obstacles) -> Tuple[dict, dict]:
+    def _compute_routing_data(self, G, obstacle_tree, inflated_obstacles, sg, sp) -> Tuple[dict, dict]:
         """
         Computes APSP for POIs and extracts ALL paths.
         Now includes POST-PROCESS SMOOTHING.
@@ -399,12 +645,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         path_data = {"starts": {}, "goals": {}, "collections": {}}
         pos = nx.get_node_attributes(G, "pos")
 
-        # --- Initialize Robot Model for Cost Calculation ---
-        sg_default = DiffDriveGeometry.default()
-        sp_default = DiffDriveParameters.default()
-
         # --- [DEBUG PRINT HERE] ---
-        v_debug, w_debug = self._get_kinematic_limits(sg_default, sp_default)
+        v_debug, w_debug = self._get_kinematic_limits(sg, sp)
         print(f"DEBUG KINEMATICS: V_max = {v_debug:.3f} m/s | Omega_max = {w_debug:.3f} rad/s")
         # --------------------------
 
@@ -435,7 +677,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
                         # 2. Calculate Cost by DURATION (Time)
                         # We use the SMOOTHED coords for cost calculation!
-                        duration = self._calculate_path_duration(smoothed_coords)
+                        duration = self._calculate_path_duration(smoothed_coords, sg, sp)
 
                         # --- NEW: CALCULATE HEADINGS ---
                         s_angle = 0.0
@@ -536,14 +778,10 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         omega_max = (2 * sg.wheelradius * w_wheel_max) / sg.wheelbase
         return v_max, omega_max
 
-    def _calculate_path_duration(self, coords: List[Tuple[float, float]]) -> float:
+    def _calculate_path_duration(self, coords: List[Tuple[float, float]], sg, sp) -> float:
         """Calculates accurate duration using robot kinematics."""
         if not coords or len(coords) < 2:
             return 0.0
-
-        # Use defaults since we are in GlobalPlanner (or pass specific ones if you have them)
-        sg = DiffDriveGeometry.default()
-        sp = DiffDriveParameters.default()
 
         v_max, w_max = self._get_kinematic_limits(sg, sp)
 

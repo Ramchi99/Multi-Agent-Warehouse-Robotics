@@ -530,21 +530,21 @@ class SpaceTimeRoadmapPlanner:
                 t_drive = dist / self.v_max
                 
                 # Turn
-                turn_steps = int(t_turn / 0.1)
+                turn_steps = int(math.ceil(t_turn / 0.1))
                 omega = self.w_max if diff > 0 else -self.w_max
                 for k in range(turn_steps):
                     traj.append(TrajectoryPoint(p1[0], p1[1], curr_h + omega*k*0.1, curr_t + k*0.1, 0, omega, 'turn'))
                 
                 curr_h = target_h
-                curr_t += t_turn
+                curr_t += turn_steps * 0.1 # [FIX] Aligned with discrete steps
                 
                 # Drive
-                drive_steps = int(t_drive / 0.1)
+                drive_steps = int(math.ceil(t_drive / 0.1))
                 for k in range(drive_steps + 1):
                     alpha = k / max(1, drive_steps)
                     traj.append(TrajectoryPoint(p1[0] + dx*alpha, p1[1] + dy*alpha, curr_h, curr_t + k*0.1, v_cmd, 0, 'drive'))
                     
-                curr_t += t_drive
+                curr_t += drive_steps * 0.1 # [FIX] Aligned with discrete steps
                 
         return traj, debug_waits
 
