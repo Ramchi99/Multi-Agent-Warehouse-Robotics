@@ -31,13 +31,14 @@ class PlanPoint:
     target_idx: int = 0
 
 class ExactSpaceTimePlanner:
-    def __init__(self, static_obstacles: List[Polygon], dt: float = 0.1, margin: float = 0.1):
+    def __init__(self, static_obstacles: List[Polygon], dt: float = 0.1, margin: float = 0.1, use_stagnation_logic: bool = True):
         self.static_obstacles = static_obstacles
         self.dt = dt
         self.decimal_dt = Decimal(str(dt))
         self.margin = margin
         self.reservations: Dict[int, List[Polygon]] = {}
         self.debugger = PlannerDebugger()
+        self.use_stagnation_logic = use_stagnation_logic
 
     def plan_prioritized(self, robots_sequence, initial_states, waypoints_dict, geometries, params):
         final_plans = {}
@@ -131,14 +132,14 @@ class ExactSpaceTimePlanner:
         last_progress_iter = 0
         
         # User Setting: Trigger quickly (100 iterations)
-        STAGNATION_THRESHOLD = 100 
+        STAGNATION_THRESHOLD = 20 
         
         # Counter for how many times we have stagnated consecutively
         # (without reaching a new record time)
         stagnation_counter = 0 
         
         iter_count = 0
-        MAX_ITERS = 50000
+        MAX_ITERS = 5000
 
         while target_idx < len(targets):
             iter_count += 1
@@ -160,7 +161,9 @@ class ExactSpaceTimePlanner:
                     stagnation_counter = 0
             
             # 2. Check for Stagnation
-            is_stagnant = (iter_count - last_progress_iter) > STAGNATION_THRESHOLD
+            is_stagnant = False
+            if self.use_stagnation_logic:
+                is_stagnant = (iter_count - last_progress_iter) > STAGNATION_THRESHOLD
 
             # --- PLANNING LOGIC ---
             safe = False
@@ -306,12 +309,14 @@ class ExactSpaceTimePlanner:
                     trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, 0.0, 0.0, target_idx))
                     continue
 
+                skipped_wait_steps = 0
                 while len(trajectory) > 0 and pop_count > 0:
                     prev_pt = trajectory.pop()
                     pop_count -= 1
                     
                     was_wait = (abs(prev_pt.v) < 1e-6 and abs(prev_pt.w) < 1e-6)
                     if was_wait:
+                        skipped_wait_steps += 1
                         pop_count += 1 
                     else:
                         if pop_count == 0:
@@ -324,11 +329,11 @@ class ExactSpaceTimePlanner:
                     current_time = restore_pt.t
                     target_idx = restore_pt.target_idx
                     self.debugger.record_backtrack(iter_count, prev_pt.t, current_time)
-                    if forced_wait_steps == 0: forced_wait_steps = 1
+                    forced_wait_steps = max(forced_wait_steps, skipped_wait_steps + 1)
                 else:
                     model._state = DiffDriveState(x=initial_state_copy.x, y=initial_state_copy.y, psi=initial_state_copy.psi)
                     current_time = 0.0
                     target_idx = 0 
-                    if forced_wait_steps == 0: forced_wait_steps = 1
+                    forced_wait_steps = max(forced_wait_steps, skipped_wait_steps + 1)
 
         return trajectory

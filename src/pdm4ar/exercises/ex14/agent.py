@@ -42,7 +42,6 @@ from .task_allocator import (
     TaskAllocatorALNS,
 )
 from .spacetime_planner import SpaceTimeRoadmapPlanner
-from .spacetime_planner_FF import SpaceTimePlannerFF
 from .exact_spacetime_planner import ExactSpaceTimePlanner, PlanPoint
 from dg_commons.sim.models.diff_drive import DiffDriveState
 
@@ -247,7 +246,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.min_sample_dist = 0.3  # Minimum distance between nodes # 0.3
         self.turn_penalty = 0.0  # Heuristic cost for "stopping and turning" (meters equivalent)
 
-        self.time_limit = 10.0  # Time limit for task allocation # 10.0
+        self.time_limit = 5.0  # Time limit for task allocation # 10.0
 
         self.seed = 42
 
@@ -484,7 +483,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         if init_sim_obs.dg_scenario and init_sim_obs.dg_scenario.static_obstacles:
             static_obs_polys = [o.shape for o in init_sim_obs.dg_scenario.static_obstacles]
         
-        exact_planner = ExactSpaceTimePlanner(static_obstacles=static_obs_polys, dt=0.1)
+        exact_planner = ExactSpaceTimePlanner(static_obstacles=static_obs_polys, dt=0.1, use_stagnation_logic=False)
 
         # 3. Run the Planner
         # We sort robots simply to ensure deterministic order (or you could prioritize them)
