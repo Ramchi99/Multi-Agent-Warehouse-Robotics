@@ -486,8 +486,37 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         exact_planner = ExactSpaceTimePlanner(static_obstacles=static_obs_polys, dt=0.1, use_stagnation_logic=False)
 
         # 3. Run the Planner
-        # We sort robots simply to ensure deterministic order (or you could prioritize them)
-        sorted_robots = sorted(list(best_assign.keys()))
+        # [NEW] Prioritization Strategy: Longest Delivery Time First
+        # We calculate the time it takes to complete all DELIVERIES.
+        # We prioritize the robot that finishes its job latest, to clear the critical path.
+        robot_priority_list = []
+        
+        for r_name, tasks in best_assign.items():
+            delivery_duration = 0.0
+            curr_node = r_name # Start at robot's own node
+            
+            for task in tasks:
+                # 1. Move to Goal
+                t_goal = cost_matrix.get(curr_node, {}).get(task.goal_id, 0.0)
+                if t_goal == float('inf'): t_goal = 1000.0
+                delivery_duration += t_goal
+                
+                # 2. Move to Collection
+                t_coll = cost_matrix.get(task.goal_id, {}).get(task.collection_id, 0.0)
+                if t_coll == float('inf'): t_coll = 1000.0
+                delivery_duration += t_coll
+                
+                curr_node = task.collection_id
+            
+            # NOTE: We do NOT add the return-to-start cost here.
+            
+            robot_priority_list.append((r_name, delivery_duration))
+        
+        # Sort Descending: Highest Duration -> First Priority
+        robot_priority_list.sort(key=lambda x: x[1], reverse=True)
+        
+        sorted_robots = [r for r, cost in robot_priority_list]
+        print(f"Priority Order (Longest Delivery First): {robot_priority_list}")
         
         final_plans_6d = exact_planner.plan_prioritized(
             robots_sequence=sorted_robots,
@@ -554,7 +583,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
     def _compute_routing_data(self, G, obstacle_tree, inflated_obstacles, sg, sp) -> Tuple[dict, dict]:
         """
         Computes APSP for POIs and extracts ALL paths.
-        Now includes POST-PROCESS SMOOTHING.
+        Now includes POST-PROCESS SMOOTHING and GOAL AVOIDANCE.
         """
         cost_matrix = {}
         heading_matrix = {}
@@ -565,6 +594,46 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         v_debug, w_debug = self._get_kinematic_limits(sg, sp)
         print(f"DEBUG KINEMATICS: V_max = {v_debug:.3f} m/s | Omega_max = {w_debug:.3f} rad/s")
         # --------------------------
+
+        # --- [NEW] PRE-CALCULATE GOAL CONFLICTS ---
+        # 1. Identify Goal Positions
+        goal_positions = {}
+        for n, d in G.nodes(data=True):
+            if d.get("type") == "goal":
+                goal_positions[d.get("label")] = pos[n]
+        
+        # 2. Map Edges to Conflicting Goals
+        # edge_conflicts[ (u,v) ] = { 'goal_id_1', 'goal_id_2' }
+        edge_conflicts = {}
+        
+        GOAL_AVOID_RADIUS = 0.35 # 0.3m + 0.05m margin
+
+        def point_line_segment_distance(px, py, x1, y1, x2, y2):
+            dx = x2 - x1
+            dy = y2 - y1
+            if dx == 0 and dy == 0:
+                return math.hypot(px - x1, py - y1)
+            t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
+            t = max(0, min(1, t))
+            nearest_x = x1 + t * dx
+            nearest_y = y1 + t * dy
+            return math.hypot(px - nearest_x, py - nearest_y)
+
+        print(f"Pre-calculating goal conflicts for {len(G.edges)} edges...")
+        for u, v in G.edges():
+            p1 = pos[u]
+            p2 = pos[v]
+            
+            conflicts = set()
+            for g_label, g_pos in goal_positions.items():
+                dist = point_line_segment_distance(g_pos[0], g_pos[1], p1[0], p1[1], p2[0], p2[1])
+                if dist < GOAL_AVOID_RADIUS:
+                    conflicts.add(g_label)
+            
+            if conflicts:
+                key = tuple(sorted((u, v)))
+                edge_conflicts[key] = conflicts
+        # ------------------------------------------
 
         starts = [(n, d.get("label")) for n, d in G.nodes(data=True) if d.get("type") == "start"]
         goals = [(n, d.get("label")) for n, d in G.nodes(data=True) if d.get("type") == "goal"]
@@ -582,10 +651,31 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 # Temp storage to find best target based on TIME, not DISTANCE
                 candidates = []
 
+                # --- [NEW] Define Forbidden Goals for this Source ---
+                # We must avoid all goals EXCEPT the one we are at (Src) or going to (Tgt)
+                base_forbidden = set(goal_positions.keys())
+                if src_label in base_forbidden:
+                    base_forbidden.remove(src_label)
+                # Note: Tgt is handled inside the inner loop
+                
                 for tgt_idx, tgt_label in target_list:
                     try:
-                        # 1. Get Shortest Path by DISTANCE (Geometric Path)
-                        path_nodes = nx.shortest_path(G, src_idx, tgt_idx, weight="weight")
+                        # Determine Forbidden Set for this specific path
+                        current_forbidden = base_forbidden.copy()
+                        if tgt_label in current_forbidden:
+                            current_forbidden.remove(tgt_label)
+                        
+                        # Custom Weight Function
+                        def weight_fn(u, v, d):
+                            key = tuple(sorted((u, v)))
+                            conflicts = edge_conflicts.get(key, set())
+                            # If edge conflicts with any FORBIDDEN goal, block it (inf cost)
+                            if not conflicts.isdisjoint(current_forbidden):
+                                return float('inf')
+                            return d.get('weight', 1.0)
+
+                        # 1. Get Shortest Path with Goal Avoidance
+                        path_nodes = nx.shortest_path(G, src_idx, tgt_idx, weight=weight_fn)
                         raw_coords = [pos[n] for n in path_nodes]
 
                         # [NEW] SMOOTH PATH

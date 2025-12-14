@@ -58,8 +58,9 @@ class ExactSpaceTimePlanner:
             r_start = time.time()
             self.debugger.start_robot(robot_name)
 
-            lower_priority_robots = robots_sequence[i+1:]
-            temp_static_obstacles = [start_footprints[r] for r in lower_priority_robots]
+            # [MODIFIED] Lower priority robots are GHOSTS. We do not treat them as static obstacles.
+            # They must yield to us.
+            temp_static_obstacles = []
 
             start_state = initial_states[robot_name]
             model = DiffDriveModel(x0=start_state, vg=geometries[robot_name], vp=params[robot_name])
