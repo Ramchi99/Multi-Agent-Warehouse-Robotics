@@ -44,6 +44,8 @@ from .task_allocator import (
 from .spacetime_planner import SpaceTimeRoadmapPlanner
 from .exact_spacetime_planner import ExactSpaceTimePlanner, PlanPoint
 from dg_commons.sim.models.diff_drive import DiffDriveState
+from .tournament_viz import TournamentVisualizer 
+from .planner_viz import PlannerVisualizer # [NEW]
 
 
 class GlobalPlanMessage(BaseModel):
@@ -96,14 +98,14 @@ class Pdm4arAgent(Agent):
         self.current_path_idx = 0
         
         # [NEW] Setup Logging
-        self.log_file = Path(f"out/ex14/debug_plots/cmd_log_{self.name}.csv")
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        # self.log_file = Path(f"out/ex14/debug_plots/cmd_log_{self.name}.csv")
+        # self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.prev_state = None
         self.prev_time = None
         
-        with open(self.log_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["t", "omega_l", "omega_r", "v_ref", "w_ref", "v_cmd", "w_cmd", "x", "y", "theta", "rx", "ry", "rtheta", "v_act", "w_act"])
+        # with open(self.log_file, 'w', newline='') as f:
+        #     writer = csv.writer(f)
+        #     writer.writerow(["t", "omega_l", "omega_r", "v_ref", "w_ref", "v_cmd", "w_cmd", "x", "y", "theta", "rx", "ry", "rtheta", "v_act", "w_act"])
         
         # Process the plan now that we know who we are
         if self._pending_global_plan_msg:
@@ -211,20 +213,20 @@ class Pdm4arAgent(Agent):
         self.prev_time = current_time
         
         # Write to CSV
-        try:
-            with open(self.log_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    current_time, 
-                    omega_l, omega_r, 
-                    v_cmd, w_cmd,       # Reference commands
-                    v_cmd, w_cmd,       # (Duplicate for compatibility with your header)
-                    x, y, theta,        # Actual State
-                    rx, ry, rtheta,     # Reference State
-                    v_act, w_act        # Actual Velocities
-                ])
-        except Exception:
-            pass 
+        # try:
+        #     with open(self.log_file, 'a', newline='') as f:
+        #         writer = csv.writer(f)
+        #         writer.writerow([
+        #             current_time, 
+        #             omega_l, omega_r, 
+        #             v_cmd, w_cmd,       # Reference commands
+        #             v_cmd, w_cmd,       # (Duplicate for compatibility with your header)
+        #             x, y, theta,        # Actual State
+        #             rx, ry, rtheta,     # Reference State
+        #             v_act, w_act        # Actual Velocities
+        #         ])
+        # except Exception:
+        #     pass 
 
         return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
 
@@ -255,7 +257,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         np.random.seed(self.seed)
         
         # [DEBUG] Inspect available global observations
-        print(f"DEBUG: GlobalPlanner init_sim_obs dir: {dir(init_sim_obs)}")
+        # print(f"DEBUG: GlobalPlanner init_sim_obs dir: {dir(init_sim_obs)}")
 
         # --- 1. EXTRACT OBSTACLES & BOUNDS (Done once) ---
         obs_polygons = []
@@ -345,24 +347,24 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # A. Run SA
-        allocator_sa = TaskAllocatorSA(**alloc_args)
-        sa_assignments, sa_hist = allocator_sa.solve(time_limit=self.time_limit)
-        sa_cost = allocator_sa._evaluate_makespan({r: RobotSchedule(r, t) for r, t in sa_assignments.items()})
+        # allocator_sa = TaskAllocatorSA(**alloc_args)
+        # sa_assignments, sa_hist = allocator_sa.solve(time_limit=self.time_limit)
+        # sa_cost = allocator_sa._evaluate_makespan({r: RobotSchedule(r, t) for r, t in sa_assignments.items()})
 
         # B. Run LNS
-        allocator_lns = TaskAllocatorLNS(**alloc_args)
-        lns_assignments, lns_hist = allocator_lns.solve(time_limit=self.time_limit)
-        lns_cost = allocator_lns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns_assignments.items()})
+        # allocator_lns = TaskAllocatorLNS(**alloc_args)
+        # lns_assignments, lns_hist = allocator_lns.solve(time_limit=self.time_limit)
+        # lns_cost = allocator_lns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns_assignments.items()})
 
         # C. Run LNS2
-        allocator_lns2 = TaskAllocatorLNS2(**alloc_args)
-        lns2_assignments, lns2_hist = allocator_lns2.solve(time_limit=self.time_limit)
-        lns2_cost = allocator_lns2._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns2_assignments.items()})
+        # allocator_lns2 = TaskAllocatorLNS2(**alloc_args)
+        # lns2_assignments, lns2_hist = allocator_lns2.solve(time_limit=self.time_limit)
+        # lns2_cost = allocator_lns2._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns2_assignments.items()})
 
         # D. Run LNS3
-        allocator_lns3 = TaskAllocatorLNS3(**alloc_args)
-        lns3_assignments, lns3_hist = allocator_lns3.solve(time_limit=self.time_limit)
-        lns3_cost = allocator_lns3._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns3_assignments.items()})
+        # allocator_lns3 = TaskAllocatorLNS3(**alloc_args)
+        # lns3_assignments, lns3_hist = allocator_lns3.solve(time_limit=self.time_limit)
+        # lns3_cost = allocator_lns3._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns3_assignments.items()})
 
         # E. Run ALNS (Adaptive)
         allocator_alns = TaskAllocatorALNS(**alloc_args)
@@ -374,187 +376,259 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
         import json
 
-        telemetry_file = out_dir / f"alns_telemetry_{timestamp}.json"
-        with open(telemetry_file, "w") as f:
-            json.dump(alns_telemetry, f, indent=2)
+        # telemetry_file = out_dir / f"alns_telemetry_{timestamp}.json"
+        # with open(telemetry_file, "w") as f:
+        #     json.dump(alns_telemetry, f, indent=2)
+        
+        # [NEW] Plot Convergence
+        viz_helper = PlannerVisualizer(robot_radius=self.robot_radius)
+        viz_helper.plot_convergence(
+            {"ALNS": alns_hist}, 
+            str(out_dir / f"convergence_{timestamp}.png")
+        )
 
         # --- ALLOCATOR COMPARISON & SELECTION ---
         print(f"--- RESULT COMPARISON (Theoretical) ---")
-        print(f"SA Cost:  {sa_cost:.2f}")
-        print(f"LNS Cost: {lns_cost:.2f}")
-        print(f"LNS2 Cost: {lns2_cost:.2f}")
-        print(f"LNS3 Cost: {lns3_cost:.2f}")
+        # print(f"SA Cost:  {sa_cost:.2f}")
+        # print(f"LNS Cost: {lns_cost:.2f}")
+        # print(f"LNS2 Cost: {lns2_cost:.2f}")
+        # print(f"LNS3 Cost: {lns3_cost:.2f}")
         print(f"ALNS Cost: {alns_cost:.2f}")
 
         # Candidates to evaluate
         candidates = [
-            ("SA", sa_assignments, sa_cost),
-            ("LNS", lns_assignments, lns_cost),
-            ("LNS2", lns2_assignments, lns2_cost),
-            ("LNS3", lns3_assignments, lns3_cost),
+            # ("SA", sa_assignments, sa_cost),
+            # ("LNS", lns_assignments, lns_cost),
+            # ("LNS2", lns2_assignments, lns2_cost),
+            # ("LNS3", lns3_assignments, lns3_cost),
         ]
         
         # Add Top K ALNS candidates
+        print("ALNS TOP Solutions:")
         for i, sol in enumerate(alns_top_k):
             cost = allocator_alns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in sol.items()})
+            print(f"  {i+1}. Cost: {cost:.2f}")
             candidates.append((f"ALNS_{i+1}", sol, cost))
 
-        # --- SELECT WINNER ---
-        # We select the candidate with the lowest Theoretical Cost
-        # candidates is a list of tuples: (name, assignments, cost)
-        best_candidate_name, best_assign, best_cost = min(candidates, key=lambda x: x[2])
-
-        # ---------------------------------------------------------------------
-        # --- 10. EXACT SPACE-TIME EXECUTION (The "Winner" Only) ---
-        # ---------------------------------------------------------------------
-        print(f"\n>> Running Exact Physics Simulation for Winner: {best_candidate_name}")
-
-        # 1. Prepare Waypoints for the Winner
-        # We need to convert the 'best_assign' (Tasks) into 'robot_waypoints' (X,Y Coordinates)
-        robot_waypoints = {}
+        # --- SELECT WINNER (PHYSICS TOURNAMENT) ---
+        # Instead of trusting the theoretical cost, we run the physics simulator 
+        # on the Top Candidates to see which one ACTUALLY executes fastest.
         
-        # We also need to gather the robot parameters for the simulator
-        geometries = {}
-        params = {}
-        initial_states_obj = {}
+        # 1. Sort candidates by theoretical cost
+        candidates.sort(key=lambda x: x[2])
+        
+        # 2. Pick Top 5 Unique Assignments to test
+        # (Deduplication based on cost is a simple proxy, or just take top 5)
+        top_candidates = candidates[:10]
+        
+        print(f"\n>> SELECTED TOP {len(top_candidates)} CANDIDATES FOR PHYSICS EVALUATION:")
+        for name, _, cost in top_candidates:
+            print(f"   - {name}: {cost:.2f} (theoretical)")
 
-        # Iterate through the assignments of the winning allocator (SA, LNS, etc.)
-        for r_name, tasks in best_assign.items():
-            
-            # A. Collect Robot Physics Data from Observations
-            # We access the observations directly to get the correct wheel radius, limits, etc.
-            p_obs = init_sim_obs.players_obs[r_name]
-            geometries[r_name] = p_obs.model_geometry
-            params[r_name] = p_obs.model_params
-            # initial_states_obj[r_name] = init_sim_obs.initial_states[r_name]
+        best_actual_makespan = float('inf')
+        best_final_plans_6d = {}
+        winner_name = "None"
+        best_waypoints = {} # For plotting
 
-            # [THE FIX IS HERE] -----------------------------------------
-            # Do not use: initial_states_obj[r_name] = init_sim_obs.initial_states[r_name]
-            # Instead, create a FRESH object using raw floats:
-            raw_s = init_sim_obs.initial_states[r_name]
-            
-            s_clean = DiffDriveState(
-                x=float(raw_s.x),
-                y=float(raw_s.y),
-                psi=float(raw_s.psi) # This forces psi=1.0
-            )
-            print(f"DEBUG: Cleaned State for {r_name}: x={s_clean.x}, y={s_clean.y}, psi={s_clean.psi}")
-            initial_states_obj[r_name] = s_clean
-            # -----------------------------------------------------------
-
-            # DEBUG: Print what the planner sees vs what the config says
-            s = initial_states_obj[r_name]
-            print(f"DEBUG: Planner Init State for {r_name}: x={s.x}, y={s.y}, psi={s.psi}")
-
-            # B. Build the list of geometric waypoints
-            wps = []
-            curr_node = r_name # The robot starts at its own named node (Start Node)
-
-            for task in tasks:
-                # Part 1: Path from Current Node -> Goal Node
-                segment_coords = self._find_path_coords_raw(path_data, curr_node, task.goal_id)
-                if segment_coords:
-                    # We extend the list with these points. 
-                    # segment_coords includes the start point, so we might want to skip it 
-                    # to avoid duplicate points, but the planner handles distance=0 gracefully.
-                    # We skip [0] to be clean.
-                    wps.extend(segment_coords[1:])
-                
-                curr_node = task.goal_id
-
-                # Part 2: Path from Goal Node -> Collection Node
-                segment_coords = self._find_path_coords_raw(path_data, curr_node, task.collection_id)
-                if segment_coords:
-                    wps.extend(segment_coords[1:])
-                
-                curr_node = task.collection_id
-            
-            # [NEW] Return to Start (Vacate Collection Point)
-            # After finishing all tasks, navigate back to the initial start node.
-            segment_coords = self._find_path_coords_raw(path_data, curr_node, r_name)
-            if segment_coords:
-                wps.extend(segment_coords[1:])
-            
-            robot_waypoints[r_name] = wps
-
-        # 2. Initialize the Exact Planner
-        # We grab the raw static obstacle polygons from the scenario
+        # We need static obstacles for the planner
         static_obs_polys = []
         if init_sim_obs.dg_scenario and init_sim_obs.dg_scenario.static_obstacles:
             static_obs_polys = [o.shape for o in init_sim_obs.dg_scenario.static_obstacles]
-        
-        exact_planner = ExactSpaceTimePlanner(static_obstacles=static_obs_polys, dt=0.1, use_stagnation_logic=False)
 
-        # 3. Run the Planner
-        # [NEW] Prioritization Strategy: Longest Delivery Time First
-        # We calculate the time it takes to complete all DELIVERIES.
-        # We prioritize the robot that finishes its job latest, to clear the critical path.
-        robot_priority_list = []
+        # 3. Tournament Loop
+        viz = TournamentVisualizer() # [NEW]
+        viz_helper = PlannerVisualizer(robot_radius=self.robot_radius) # [NEW]
         
-        for r_name, tasks in best_assign.items():
-            delivery_duration = 0.0
-            curr_node = r_name # Start at robot's own node
+        for cand_name, cand_assign, cand_theo_cost in top_candidates:
+            print(f"\n   [Evaluating {cand_name}] ...")
             
-            for task in tasks:
-                # 1. Move to Goal
-                t_goal = cost_matrix.get(curr_node, {}).get(task.goal_id, 0.0)
-                if t_goal == float('inf'): t_goal = 1000.0
-                delivery_duration += t_goal
-                
-                # 2. Move to Collection
-                t_coll = cost_matrix.get(task.goal_id, {}).get(task.collection_id, 0.0)
-                if t_coll == float('inf'): t_coll = 1000.0
-                delivery_duration += t_coll
-                
-                curr_node = task.collection_id
+            # --- A. Prepare Waypoints ---
+            robot_waypoints = {}
+            geometries = {}
+            params = {}
+            initial_states_obj = {}
             
-            # NOTE: We do NOT add the return-to-start cost here.
-            
-            robot_priority_list.append((r_name, delivery_duration))
-        
-        # Sort Descending: Highest Duration -> First Priority
-        robot_priority_list.sort(key=lambda x: x[1], reverse=True)
-        
-        sorted_robots = [r for r, cost in robot_priority_list]
-        print(f"Priority Order (Longest Delivery First): {robot_priority_list}")
-        
-        final_plans_6d = exact_planner.plan_prioritized(
-            robots_sequence=sorted_robots,
-            initial_states=initial_states_obj,
-            waypoints_dict=robot_waypoints,
-            geometries=geometries,
-            params=params
-        )
+            # Track where the "real work" ends for each robot
+            robot_last_task_idx = {} 
 
-        # 4. Convert to Message Format
-        # We convert the PlanPoint objects into the tuple format required by GlobalPlanMessage
-        # (x, y, theta, t, v, w)
+            for r_name, tasks in cand_assign.items():
+                # Physics Data
+                p_obs = init_sim_obs.players_obs[r_name]
+                geometries[r_name] = p_obs.model_geometry
+                params[r_name] = p_obs.model_params
+                
+                # Clean State
+                raw_s = init_sim_obs.initial_states[r_name]
+                initial_states_obj[r_name] = DiffDriveState(
+                    x=float(raw_s.x), y=float(raw_s.y), psi=float(raw_s.psi)
+                )
+
+                # Waypoints
+                wps = []
+                curr_node = r_name 
+                for task in tasks:
+                    # Path -> Goal
+                    seg = self._find_path_coords_raw(path_data, curr_node, task.goal_id)
+                    if seg: wps.extend(seg[1:])
+                    curr_node = task.goal_id
+                    
+                    # Path -> Collection
+                    seg = self._find_path_coords_raw(path_data, curr_node, task.collection_id)
+                    if seg: wps.extend(seg[1:])
+                    curr_node = task.collection_id
+                
+                # [NEW] Mark the end of tasks
+                robot_last_task_idx[r_name] = len(wps)
+                
+                # Return to Start
+                seg = self._find_path_coords_raw(path_data, curr_node, r_name)
+                if seg: wps.extend(seg[1:])
+                
+                robot_waypoints[r_name] = wps
+
+            # --- B. Calculate Priority (Longest Delivery First) ---
+            robot_priority_list = []
+            for r_name, tasks in cand_assign.items():
+                delivery_duration = 0.0
+                curr_node = r_name
+                for task in tasks:
+                    t_goal = cost_matrix.get(curr_node, {}).get(task.goal_id, 1000.0)
+                    delivery_duration += t_goal
+                    t_coll = cost_matrix.get(task.goal_id, {}).get(task.collection_id, 1000.0)
+                    delivery_duration += t_coll
+                    curr_node = task.collection_id
+                robot_priority_list.append((r_name, delivery_duration))
+            
+            robot_priority_list.sort(key=lambda x: x[1], reverse=True)
+            sorted_robots = [r for r, c in robot_priority_list]
+            # print(f"     Priority: {sorted_robots}")
+
+            # --- C. Run Exact Planner ---
+            # Instantiate fresh planner for each candidate
+            exact_planner = ExactSpaceTimePlanner(static_obstacles=static_obs_polys, dt=0.1, use_stagnation_logic=False)
+            
+            plan_start_t = time.time()
+            plans_6d = exact_planner.plan_prioritized(
+                robots_sequence=sorted_robots,
+                initial_states=initial_states_obj,
+                waypoints_dict=robot_waypoints,
+                geometries=geometries,
+                params=params
+            )
+            plan_dur = time.time() - plan_start_t
+            
+            # --- D. Measure Actual Makespan (Delivery Only) & Validity ---
+            actual_makespan = 0.0
+            is_valid_candidate = True 
+            
+            # 1. Check Task Completion
+            for r_name, r_traj in plans_6d.items():
+                if not r_traj: 
+                    is_valid_candidate = False
+                    continue
+                
+                limit_idx = robot_last_task_idx.get(r_name, 0)
+                delivery_t = 0.0
+                found = False
+                
+                if r_traj[-1].target_idx < limit_idx:
+                    is_valid_candidate = False
+                
+                for pt in r_traj:
+                    if pt.target_idx >= limit_idx:
+                        delivery_t = pt.t
+                        found = True
+                        break
+                
+                if not found:
+                    delivery_t = r_traj[-1].t
+                    
+                actual_makespan = max(actual_makespan, delivery_t)
+            
+            # 2. Gather Stats & Check MAX_ITERS
+            total_backtracks = 0
+            total_collisions = 0
+            total_iterations = 0 
+            per_robot_times = []
+            per_robot_iters = []
+            
+            if exact_planner.debugger and exact_planner.debugger.logs:
+                for r_name in sorted_robots:
+                    r_log = exact_planner.debugger.logs.get(r_name, {})
+                    
+                    total_backtracks += len(r_log.get('backtracks', []))
+                    total_collisions += len(r_log.get('collisions', []))
+                    
+                    iters_list = r_log.get('iterations', [])
+                    it = iters_list[-1] if iters_list else 0
+                    t = max(0.0, r_log.get('wall_time', 0.0))
+                    
+                    if it >= exact_planner.MAX_ITERS:
+                        is_valid_candidate = False
+                        print(f"     [Fail] Robot {r_name} hit MAX_ITERS ({it})")
+                    
+                    total_iterations += it
+                    per_robot_times.append(t)
+                    per_robot_iters.append(it)
+            
+            # 3. Record & Print Result (AFTER Validity Update)
+            viz.record_result(
+                cand_name, cand_theo_cost, actual_makespan, plan_dur, total_backtracks, total_collisions, total_iterations,
+                per_robot_times, per_robot_iters, is_valid=is_valid_candidate
+            )
+            
+            status_str = "VALID" if is_valid_candidate else "INVALID"
+            print(f"   -> Result {cand_name}: Theo={cand_theo_cost:.2f}s | Actual={actual_makespan:.2f}s | Status={status_str}")
+            
+            # 4. Update Winner
+            if 'best_is_valid' not in locals(): best_is_valid = False
+            better_found = False
+            
+            if is_valid_candidate and not best_is_valid:
+                better_found = True
+            elif is_valid_candidate and best_is_valid:
+                if actual_makespan < best_actual_makespan:
+                    better_found = True
+            elif not is_valid_candidate and not best_is_valid:
+                if actual_makespan < best_actual_makespan:
+                    better_found = True
+            
+            if better_found:
+                best_actual_makespan = actual_makespan
+                best_final_plans_6d = plans_6d
+                winner_name = cand_name
+                best_waypoints = robot_waypoints
+                best_is_valid = is_valid_candidate
+        
+        # Plot Summary
+        viz.plot_all()
+
+        # ---------------------------------------------------------------------
+        # --- 4. Finalize Winner ---
+        # ---------------------------------------------------------------------
+        print(f"\n>> TOURNAMENT WINNER: {winner_name} (Time: {best_actual_makespan:.2f}s)")
+        
+        # Convert to Message Format
         paths_output_6d = {}
-        for r_name, plan_points in final_plans_6d.items():
+        for r_name, plan_points in best_final_plans_6d.items():
             paths_output_6d[r_name] = [(p.x, p.y, p.theta, p.t, p.v, p.w) for p in plan_points]
 
-        # Create the message
         global_plan_message = GlobalPlanMessage(paths=paths_output_6d)
         
-        # Helper for plotting
+        # Plotting
         paths_output_xy_plot = {r: [(p[0], p[1]) for p in traj] for r, traj in paths_output_6d.items()}
-
-        # --- Plot Winner PRM with Paths ---
-        filename_prm = out_dir / f"prm_debug_{timestamp}_{best_candidate_name}.png"
-        self._plot_prm(
+        filename_prm = out_dir / f"prm_debug_{timestamp}_{winner_name}.png"
+        viz_helper.plot_prm(
             G, obs_polygons, special_nodes_plot, str(filename_prm), bounds, path_data, final_paths=paths_output_xy_plot
         )
-
-        # [NEW] Debug Plotting
-        self._plot_trajectory_comparison(
-            waypoints_dict=robot_waypoints,
-            final_plans_6d=final_plans_6d,
+        viz_helper.plot_trajectory_comparison(
+            waypoints_dict=best_waypoints,
+            final_plans_6d=best_final_plans_6d,
             obstacles=static_obs_polys,
             filename=str(out_dir / f"traj_debug_{timestamp}.png")
         )
 
         return global_plan_message.model_dump_json(round_trip=True)
-
     def _find_path_coords(self, path_data, src, dst):
         """Helper to find path coordinates from any bucket"""
         for cat in path_data.values():
@@ -962,294 +1036,3 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                         edges_added += 1
 
         return G
-
-    def _plot_prm(self, G, obstacles, special_nodes, filename, bounds=None, path_data=None, final_paths=None):
-        plt.figure(figsize=(12, 12))
-
-        # --- 1. Plot Buffered Obstacles (Inflated Boundaries) ---
-        added_buffer_label = False
-        for poly in obstacles:
-            buffered = poly.buffer(self.robot_radius)
-
-            def plot_poly_outline(geom, label=None):
-                x, y = geom.exterior.xy
-                plt.plot(x, y, "k--", linewidth=1, alpha=0.5, label=label)
-                for interior in geom.interiors:
-                    x, y = interior.xy
-                    plt.plot(x, y, "k--", linewidth=1, alpha=0.5)
-
-            if buffered.geom_type == "Polygon":
-                label = "Buffered (C-Space)" if not added_buffer_label else None
-                plot_poly_outline(buffered, label)
-                if label:
-                    added_buffer_label = True
-            elif buffered.geom_type == "MultiPolygon":
-                for i, geom in enumerate(buffered.geoms):
-                    label = "Buffered (C-Space)" if (not added_buffer_label and i == 0) else None
-                    plot_poly_outline(geom, label)
-                    if label:
-                        added_buffer_label = True
-
-        # --- 2. Plot Real Obstacles ---
-        added_obs_label = False
-        for poly in obstacles:
-
-            def fill_poly(geom, label=None):
-                x, y = geom.exterior.xy
-                plt.fill(x, y, color="gray", alpha=0.5, label=label)
-
-            if poly.geom_type == "Polygon":
-                label = "Static Obstacle" if not added_obs_label else None
-                fill_poly(poly, label)
-                if label:
-                    added_obs_label = True
-            elif poly.geom_type == "MultiPolygon":
-                for i, geom in enumerate(poly.geoms):
-                    label = "Static Obstacle" if (not added_obs_label and i == 0) else None
-                    fill_poly(geom, label)
-                    if label:
-                        added_obs_label = True
-
-        # --- 3. Plot Edges ---
-        pos = nx.get_node_attributes(G, "pos")
-        if pos:
-            lines = [[pos[u], pos[v]] for u, v in G.edges()]
-            from matplotlib.collections import LineCollection
-
-            lc = LineCollection(lines, colors="green", linewidths=0.5, alpha=0.2)
-            plt.gca().add_collection(lc)
-            plt.plot([], [], color="green", linewidth=0.5, label="PRM Edges")
-
-            # --- 4. Plot Nodes (Samples) ---
-            sample_x = [pos[n][0] for n in G.nodes if G.nodes[n].get("type") == "sample"]
-            sample_y = [pos[n][1] for n in G.nodes if G.nodes[n].get("type") == "sample"]
-            plt.plot(sample_x, sample_y, "k.", markersize=1, alpha=0.5, label="Samples")
-
-        # --- 5. Plot Special Nodes ---
-        for key, color, marker, label_text in [
-            ("starts", "b", "o", "Start"),
-            ("goals", "r", "x", "Goal"),
-            ("collections", "orange", "d", "Collection"),
-        ]:
-            if special_nodes[key]:
-                sx, sy = zip(*special_nodes[key])
-                plt.plot(
-                    sx, sy, color=color, marker=marker, linestyle="None", markersize=10, label=label_text, zorder=20
-                )
-
-        # --- 6. Plot Final Paths (If Available) ---
-        if final_paths:
-            colors = ["cyan", "magenta", "yellow", "lime", "blue"]
-            for i, (robot_name, coords) in enumerate(final_paths.items()):
-                if not coords:
-                    continue
-                c = colors[i % len(colors)]
-                plt.plot(*zip(*coords), color=c, linewidth=4, alpha=0.8, label=f"Plan {robot_name}", zorder=30)
-
-        # Fallback to plotting fragments if no final path
-        elif path_data:
-
-            def plot_category_paths(category, color_code):
-                if category not in path_data:
-                    return
-                for src_label, targets in path_data[category].items():
-                    for tgt_label, info in targets.items():
-                        path = info["coords"]
-                        is_best = info["is_best"]
-                        if is_best:
-                            plt.plot(*zip(*path), color=color_code, linestyle="-", linewidth=2.5, alpha=0.4, zorder=5)
-
-            plot_category_paths("starts", "darkviolet")
-            plot_category_paths("goals", "brown")
-
-        # --- 7. Final Setup ---
-        plt.legend(loc="upper right", fontsize="small", framealpha=0.9)
-        plt.title(f"Plan (N={len(G.nodes)}, Edges={len(G.edges)})")
-        plt.axis("equal")
-        if bounds:
-            plt.xlim(bounds[0], bounds[2])
-            plt.ylim(bounds[1], bounds[3])
-        plt.grid(True, which="both", linestyle="--", alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(filename)
-        plt.close()
-
-    def _plot_trajectory_comparison(self, waypoints_dict, final_plans_6d, obstacles, filename):
-        """
-        Plots the Raw Waypoints vs the Calculated Physics Trajectory.
-        Robust to different Shapely geometry types (Polygon, LinearRing, etc.)
-        """
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(12, 12))
-        
-        # 1. Plot Obstacles (Robustly)
-        for poly in obstacles:
-            # Handle Multi-geometries (MultiPolygon, GeometryCollection)
-            geoms = poly.geoms if hasattr(poly, "geoms") else [poly]
-            
-            for geom in geoms:
-                try:
-                    if geom.geom_type == 'Polygon':
-                        # Polygons have an exterior
-                        x, y = geom.exterior.xy
-                        plt.fill(x, y, color="gray", alpha=0.5, label="Obstacle" if "Obstacle" not in plt.gca().get_legend_handles_labels()[1] else "")
-                    elif geom.geom_type in ['LinearRing', 'LineString']:
-                        # LinearRings are just lines (no exterior attribute)
-                        x, y = geom.xy
-                        plt.plot(x, y, color="gray", linewidth=2, alpha=0.5, label="Obstacle" if "Obstacle" not in plt.gca().get_legend_handles_labels()[1] else "")
-                    else:
-                        print(f"Warning: Skipping unsupported geometry type: {geom.geom_type}")
-                except Exception as e:
-                    print(f"Error plotting geometry: {e}")
-
-        # 2. Plot Paths per Robot
-        colors = ['red', 'green', 'blue', 'orange', 'purple', 'brown']
-        
-        for i, r_name in enumerate(final_plans_6d.keys()):
-            c = colors[i % len(colors)]
-            
-            # A. Plot Raw Waypoints (The Input)
-            if r_name in waypoints_dict:
-                wps = waypoints_dict[r_name]
-                if wps:
-                    wx, wy = zip(*wps)
-                    plt.plot(wx, wy, color=c, marker='x', linestyle='--', linewidth=1, markersize=8, alpha=0.5, label=f"{r_name} Raw Input")
-            
-            # B. Plot Calculated Physics Trajectory (The Output)
-            plan = final_plans_6d[r_name]
-            if plan:
-                px = [p.x for p in plan]
-                py = [p.y for p in plan]
-                
-                # Plot the line
-                plt.plot(px, py, color=c, linewidth=2, label=f"{r_name} Physics Plan")
-                
-                # Plot Orientation Arrows (Subsample every ~1s)
-                arrow_step = 10
-                if len(plan) > arrow_step:
-                    quiver_x = px[::arrow_step]
-                    quiver_y = py[::arrow_step]
-                    quiver_u = [math.cos(p.theta) for p in plan[::arrow_step]]
-                    quiver_v = [math.sin(p.theta) for p in plan[::arrow_step]]
-                    
-                    plt.quiver(quiver_x, quiver_y, quiver_u, quiver_v, color=c, scale=20, width=0.003, alpha=0.8)
-
-        plt.title(f"Trajectory Debug: Raw Input vs Physics Plan")
-        plt.legend(loc="upper right")
-        plt.axis("equal")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(filename)
-        plt.close()
-        print(f"Generated trajectory comparison plot: {filename}")
-
-    def _print_debug_comparison(self, sa_assignments, lns_assignments, cost_matrix, heading_matrix):
-        """
-        Prints a detailed step-by-step breakdown of SA vs LNS plans.
-        """
-        print("\n" + "=" * 80)
-        print("DEBUG: DETAILED PLAN COMPARISON")
-        print("=" * 80)
-
-        # Helper to print one schedule
-        def analyze_schedule(name, assignments):
-            print(f"\n>>> ANALYSIS FOR: {name}")
-            total_makespan = 0.0
-
-            for r_name, tasks in assignments.items():
-                if not tasks:
-                    print(f"  [Robot {r_name}] IDLE")
-                    continue
-
-                print(f"  [Robot {r_name}]")
-
-                # Get Start State
-                curr_node = r_name
-                # We need to find the robot's initial heading from the InitSimGlobalObservations
-                # But here we just assume the allocator passed it correctly.
-                # For debug, let's grab it from the heading matrix if possible or assume 0
-                # (Ideally, pass initial_headings dict to this function, but we'll infer).
-                curr_heading = 0.0  # Placeholder, logic below fixes this relative to path
-
-                robot_time = 0.0
-
-                for i, task in enumerate(tasks):
-                    # 1. Move to Goal
-                    try:
-                        # Data for Current -> Goal
-                        d_g = cost_matrix.get(curr_node, {}).get(task.goal_id, 0.0)
-                        angles_g = heading_matrix.get(curr_node, {}).get(task.goal_id, (0.0, 0.0))
-
-                        # Calculate Turn
-                        # (We can't get exact start heading easily without passing more data,
-                        # but we can show the path heading)
-                        path_h_start = angles_g[0]
-                        path_h_end = angles_g[1]
-
-                        print(f"    {i+1}. {curr_node} -> {task.goal_id}")
-                        print(f"       Dist: {d_g:.2f}s | Path Headings: {path_h_start:.2f} -> {path_h_end:.2f}")
-
-                        robot_time += d_g  # (Plus turning time which is calculated in allocator)
-
-                        # 2. Move to Collection
-                        d_c = cost_matrix.get(task.goal_id, {}).get(task.collection_id, 0.0)
-                        angles_c = heading_matrix.get(task.goal_id, {}).get(task.collection_id, (0.0, 0.0))
-                        path_h_start_c = angles_c[0]
-                        path_h_end_c = angles_c[1]
-
-                        print(f"       {task.goal_id} -> {task.collection_id} (Collection)")
-                        print(f"       Dist: {d_c:.2f}s | Path Headings: {path_h_start_c:.2f} -> {path_h_end_c:.2f}")
-
-                        robot_time += d_c
-
-                        curr_node = task.collection_id
-                    except Exception as e:
-                        print(f"       ERROR analyzing task: {e}")
-
-                print(f"    Total Approx Travel Time (excluding turns): {robot_time:.2f}s")
-                total_makespan = max(total_makespan, robot_time)
-
-            return total_makespan
-
-        analyze_schedule("SA SOLUTION", sa_assignments)
-        analyze_schedule("LNS SOLUTION", lns_assignments)
-        print("=" * 80 + "\n")
-
-    def _plot_convergence(self, histories, filename):
-        plt.figure(figsize=(12, 8))
-
-        # Determine global max time to extend plots to the right edge
-        global_max_t = 0.0
-        for h in histories.values():
-            if h:
-                global_max_t = max(global_max_t, h[-1][0])
-        # Add a small buffer or assume time_limit was ~global_max_t
-        global_max_t = max(global_max_t, 0.1)
-
-        for name, history in histories.items():
-            if not history:
-                continue
-            history.sort(key=lambda x: x[0])
-
-            times = [t for t, c in history]
-            costs = [c for t, c in history]
-
-            # Extend the line to the global max time for visual comparison
-            if times[-1] < global_max_t:
-                times.append(global_max_t)
-                costs.append(costs[-1])
-
-            # Plot
-            final_c = costs[-1]
-            plt.step(times, costs, where="post", label=f"{name} ({final_c:.2f})", linewidth=2.5, alpha=0.8)
-            plt.plot(times, costs, "o", markersize=5, alpha=0.6)  # Mark improvements
-
-        plt.xlabel("Computation Time (s)", fontsize=12)
-        plt.ylabel("Theoretical Cost", fontsize=12)
-        plt.title("Optimization Convergence Profile", fontsize=14)
-        plt.legend(fontsize=10, loc="best")
-        plt.grid(True, which="both", linestyle="--", alpha=0.5)
-        plt.minorticks_on()
-        plt.tight_layout()
-        plt.savefig(filename)
-        plt.close()
