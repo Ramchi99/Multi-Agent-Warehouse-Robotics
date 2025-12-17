@@ -31,6 +31,7 @@ class PlanPoint:
     v: float
     w: float
     target_idx: int = 0
+    accumulated_dist: float = 0.0
 
 
 class ExactSpaceTimePlanner:
@@ -44,12 +45,13 @@ class ExactSpaceTimePlanner:
         self.reservations: Dict[int, List[Polygon]] = {}
         self.debugger = PlannerDebugger()
         self.use_stagnation_logic = use_stagnation_logic
-        self.MAX_ITERS = 2000 # [NEW]
+        self.MAX_ITERS = 10000 # [NEW]
 
-    def plan_prioritized(self, robots_sequence, initial_states, waypoints_dict, geometries, params):
+    def plan_prioritized(self, robots_sequence, initial_states, waypoints_dict, geometries, params, time_limit: float = 60.0, best_known_makespan: float = float('inf')):
         final_plans = {}
         self.reservations.clear()
         total_start = time.time()
+        deadline = total_start + time_limit
 
         start_footprints = {}
         for r_name in robots_sequence:
@@ -60,6 +62,11 @@ class ExactSpaceTimePlanner:
             start_footprints[r_name] = apply_SE2_to_shapely_geo(footprint_poly, tform)
 
         for i, robot_name in enumerate(robots_sequence):
+            # Global Timeout Check
+            if time.time() > deadline:
+                print(f"Global Timeout reached before planning {robot_name}. Aborting.")
+                break
+                
             print(f"Planning physics execution for {robot_name}...")
             r_start = time.time()
             self.debugger.start_robot(robot_name)
@@ -72,7 +79,18 @@ class ExactSpaceTimePlanner:
             model = DiffDriveModel(x0=start_state, vg=geometries[robot_name], vp=params[robot_name])
             targets = waypoints_dict.get(robot_name, [])
 
-            trajectory = self._plan_single_robot_backtracking(model, targets, extra_static_obstacles=temp_static_obstacles)
+            trajectory = self._plan_single_robot_backtracking(
+                model, 
+                targets, 
+                extra_static_obstacles=temp_static_obstacles,
+                deadline=deadline,
+                pruning_threshold=best_known_makespan + 1.0 # [NEW] Pruning limit
+            )
+            
+            if trajectory is None:
+                print(f"Planning for {robot_name} failed (Timeout/Pruned). Stopping global plan.")
+                break
+                
             final_plans[robot_name] = trajectory
             
             dur = max(0.0, time.time() - r_start)
@@ -106,10 +124,14 @@ class ExactSpaceTimePlanner:
         self.debugger.plot_summary(self.static_obstacles)
         return final_plans
 
-    def _plan_single_robot_backtracking(self, model, targets, extra_static_obstacles):
+    def _plan_single_robot_backtracking(self, model, targets, extra_static_obstacles, deadline=None, pruning_threshold=float('inf')):
         trajectory: List[PlanPoint] = []
         current_time = 0.0
+        current_dist = 0.0 # [NEW]
         initial_state_copy = DiffDriveState(x=model._state.x, y=model._state.y, psi=model._state.psi)
+        
+        # Log Initial State
+        self.debugger.record_iteration(0, 0.0, 0, 0.0, 0.0, 0.0)
 
         # Physics Constants
         r = model.vg.wheelradius
@@ -124,12 +146,12 @@ class ExactSpaceTimePlanner:
             return DiffDriveCommands(omega_l=omega_l, omega_r=omega_r)
 
         def is_safe(next_poly, time_idx):
-            for obs in self.static_obstacles:
-                if obs.intersects(next_poly):
-                    return False
-            for obs in extra_static_obstacles:
-                if obs.intersects(next_poly):
-                    return False
+            # for obs in self.static_obstacles:
+            #     if obs.intersects(next_poly):
+            #         return False
+            # for obs in extra_static_obstacles:
+            #     if obs.intersects(next_poly):
+            #         return False
             if time_idx in self.reservations:
                 for reserved_poly in self.reservations[time_idx]:
                     if reserved_poly.intersects(next_poly):
@@ -138,66 +160,63 @@ class ExactSpaceTimePlanner:
 
         target_idx = 0
         forced_wait_steps = 0
-
-        # --- ADAPTIVE STAGNATION CONFIG ---
-        max_reached_time = 0.0
-        last_progress_iter = 0
-
-        # User Setting: Trigger quickly (100 iterations)
-        STAGNATION_THRESHOLD = 20
-
-        # Counter for how many times we have stagnated consecutively
-        # (without reaching a new record time)
-        stagnation_counter = 0 
+        
+        # --- ESCALATION STATE ---
+        max_progress_idx = 0
+        consecutive_backtrack_count = 0 # [MODIFIED]
+        
+        # Tuning Parameters
+        L2_THRESHOLD = 3 # [MODIFIED]
+        L3_THRESHOLD = 3 # [MODIFIED]
+        L4_THRESHOLD = 3 # [NEW]
+        L5_THRESHOLD = 3 # [NEW]
         
         iter_count = 0
         # MAX_ITERS = 50000
 
         while target_idx < len(targets):
             iter_count += 1
-            if iter_count % 5 == 0:
-                 self.debugger.record_iteration(iter_count, current_time, target_idx)
-
+            # [MODIFIED] Moved logging to end of loop for accurate "result of iteration"
+            
+            # Checks
             if iter_count > self.MAX_ITERS:
                 print(f"WARNING: Max iterations reached. Stopping.")
-                break
-
-            # 1. Update Global Progress (The "High Score")
-            if current_time > max_reached_time:
-                max_reached_time = current_time
-                last_progress_iter = iter_count
-
-                # We broke through the deadlock! Reset the severity level.
-                if stagnation_counter > 0:
-                    # print(f"  [Recovered] Broke through barrier after {stagnation_counter} jumps.")
-                    stagnation_counter = 0
-
-            # 2. Check for Stagnation
-            is_stagnant = False
-            # if self.use_stagnation_logic:
-            #     is_stagnant = (iter_count - last_progress_iter) > STAGNATION_THRESHOLD
+                return None # Fail
+            
+            if deadline and time.time() > deadline:
+                print(f"Timeout inside planning loop.")
+                return None # Fail
+            
+            # [NEW] Pruning Check: If current sim time exceeds best known + margin
+            if current_time > pruning_threshold:
+                print(f"Pruned: Current time {current_time:.2f}s > Threshold {pruning_threshold:.2f}s")
+                return None # Fail (Not Optimal)
+            
+            # 1. Progress Check
+            if target_idx > max_progress_idx:
+                max_progress_idx = target_idx
+                consecutive_backtrack_count = 0 # Reset escalation
+            
+            # Note: We no longer increment a 'struggle_count' here.
+            # We ONLY count explicit backtracks.
 
             # --- PLANNING LOGIC ---
             safe = False
             cmd_v, cmd_w = 0.0, 0.0
-
-            if is_stagnant:
-                # Force failure to trigger the Jump Logic below
-                safe = False
-
-            elif forced_wait_steps > 0:
+            
+            if forced_wait_steps > 0:
                 # [WAIT SUBSTITUTION MODE]
                 # We are replaying history with WAITS instead of Moves
                 cmd_v, cmd_w = 0.0, 0.0
                 forced_wait_steps -= 1
-
+                
                 cmd = get_cmds_inverse(0.0, 0.0)
                 next_model = DiffDriveModel(x0=model._state, vg=model.vg, vp=model.vp)
                 next_model.update(cmd, self.decimal_dt)
                 next_poly = next_model.get_footprint()
                 next_time_idx = int(round((current_time + self.dt) / self.dt))
                 safe = is_safe(next_poly, next_time_idx)
-
+                
             else:
                 # [NORMAL GREEDY MODE]
                 tx, ty = targets[target_idx]
@@ -207,6 +226,8 @@ class ExactSpaceTimePlanner:
 
                 if dist < 1e-3:
                     target_idx += 1
+                    # Log state (no move)
+                    self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, 0.0, 0.0)
                     continue
 
                 heading_fwd = math.atan2(dy, dx)
@@ -247,27 +268,33 @@ class ExactSpaceTimePlanner:
             if safe:
                 model.update(cmd, self.decimal_dt)
                 current_time += self.dt
+                # Update Distance (Approximate arc length)
+                # If rotating in place, dist doesn't change much, or we can use 0 for pure rotation.
+                # Here we use linear velocity contribution.
+                current_dist += abs(cmd_v) * self.dt
+                
                 s = model._state
-                trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, cmd_v, cmd_w, target_idx))
+                trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, cmd_v, cmd_w, target_idx, current_dist))
 
                 # [VISUALIZATION] Record Waits
-                if iter_count % 5 == 0:
-                    is_waiting = abs(cmd_v) < 1e-6 and abs(cmd_w) < 1e-6
-                    if is_waiting:
-                        self.debugger.record_wait(iter_count, current_time)
+                is_waiting = abs(cmd_v) < 1e-6 and abs(cmd_w) < 1e-6
+                if is_waiting:
+                    self.debugger.record_wait(iter_count, current_time)
+
+                # Log SUCCESS
+                self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, cmd_v, cmd_w)
 
                 # Note: We do NOT reset last_progress_iter here.
                 # It is only reset if current_time > max_reached_time.
             else:
                 # FAILURE HANDLING
-                if not is_stagnant:
-                    self.debugger.record_collision(next_poly.centroid.x, next_poly.centroid.y)
-                    # Cancel forced wait if we crash while waiting
-                    forced_wait_steps = 0
+                self.debugger.record_collision(iter_count, current_time, next_poly.centroid.x, next_poly.centroid.y)
+                # Cancel forced wait if we crash while waiting
+                forced_wait_steps = 0
 
-                # 1. Try One Single Greedy Wait (Only if NOT Stagnant)
+                # 1. Try One Single Greedy Wait
                 wait_success = False
-                if not is_stagnant and forced_wait_steps == 0:
+                if forced_wait_steps == 0:
                     already_waiting = abs(cmd_v) < 1e-6 and abs(cmd_w) < 1e-6
                     if not already_waiting:
                         wait_model = DiffDriveModel(x0=model._state, vg=model.vg, vp=model.vp)
@@ -278,80 +305,90 @@ class ExactSpaceTimePlanner:
                         if is_safe(wait_poly, wait_time_idx):
                             model.update(DiffDriveCommands(0, 0), self.decimal_dt)
                             current_time += self.dt
+                            # Wait adds 0 distance
                             s = model._state
-                            trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, 0.0, 0.0, target_idx))
+                            trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, 0.0, 0.0, target_idx, current_dist))
                             wait_success = True
+                            
+                            # Log Wait Success
+                            self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, 0.0, 0.0)
 
                 if wait_success:
                     continue
 
-                # 2. BACKTRACK LOGIC
-
-                # Determine Jump Size based on Escalation
-                pop_count = 1
-
-                if is_stagnant:
-                    stagnation_counter += 1
-
-                    # [ESCALATION LOGIC]
-                    if stagnation_counter <= 2:
-                        jump_steps = 5  # Level 1: 0.5s (Try twice)
-                    elif stagnation_counter <= 4:
-                        jump_steps = 10  # Level 2: 1.0s (Try twice)
-                    else:
-                        jump_steps = 20  # Level 3: 2.0s (Panic mode)
-
-                    print(f"  [Stagnation L{stagnation_counter}] Jump {jump_steps} steps & Wait.")
-                    self.debugger.record_stagnation(iter_count, current_time)
-
-                    pop_count = jump_steps
-                    forced_wait_steps = jump_steps  # "Wait Substitution"
-
-                    # Reset watchdog
-                    last_progress_iter = iter_count
-                    # We do NOT reset max_reached_time, because we want to know if this jump
-                    # actually helped us beat the previous record.
-
-                # Check if we can actually pop that many
-                if len(trajectory) < pop_count:
-                    pop_count = len(trajectory)  # Pop everything if needed
-
-                # Pop Loop
+                # 2. ESCALATING BACKTRACK LOGIC
+                consecutive_backtrack_count += 1 # [MODIFIED] Increment ONLY when we actually backtrack
+                
+                # Determine "Pop Magnitude" (Moves, not Steps)
+                moves_to_pop = 1
+                
+                # Logic: L2=3 means "After 3 backtracks, switch to Medium". 
+                # So backtracks #1, #2, #3 are Small. #4 is Medium.
+                # OR does user mean "3 Small, then 3 Medium"?
+                # "Trigger medium ... after a fixed count of used small backtracks"
+                # So:
+                # Count 1, 2, 3 -> Small (Pop 1)
+                # Count 4, 5, 6 -> Medium (Pop 2)
+                # Count 7, 8, 9 -> Large (Pop 5)
+                # Count 10, 11, 12 -> Huge (Pop 10)
+                # Count 13+ -> Massive (Pop 15)
+                
+                if consecutive_backtrack_count > (L2_THRESHOLD + L3_THRESHOLD + L4_THRESHOLD + L5_THRESHOLD):
+                    moves_to_pop = 15
+                elif consecutive_backtrack_count > (L2_THRESHOLD + L3_THRESHOLD + L4_THRESHOLD):
+                    moves_to_pop = 10
+                elif consecutive_backtrack_count > (L2_THRESHOLD + L3_THRESHOLD):
+                    moves_to_pop = 5
+                elif consecutive_backtrack_count > L2_THRESHOLD:
+                    moves_to_pop = 2
+                
+                popped_moves_count = 0
+                skipped_old_waits = 0
+                
                 if len(trajectory) == 0:
-                    # Cannot backtrack from start
-                    model.update(DiffDriveCommands(0, 0), self.decimal_dt)
+                    # Cannot backtrack from start - just wait here
+                    model.update(DiffDriveCommands(0,0), self.decimal_dt)
                     current_time += self.dt
+                    # Start Wait
                     s = model._state
-                    trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, 0.0, 0.0, target_idx))
+                    trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, 0.0, 0.0, target_idx, current_dist))
+                    self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, 0.0, 0.0)
                     continue
 
-                skipped_wait_steps = 0
-                while len(trajectory) > 0 and pop_count > 0:
+                # Pop Loop: Remove X moves, skipping past waits
+                while len(trajectory) > 0 and moves_to_pop > 0:
                     prev_pt = trajectory.pop()
-                    pop_count -= 1
-
-                    was_wait = abs(prev_pt.v) < 1e-6 and abs(prev_pt.w) < 1e-6
-                    if was_wait:
-                        skipped_wait_steps += 1
-                        pop_count += 1
+                    
+                    is_wait_step = (abs(prev_pt.v) < 1e-6 and abs(prev_pt.w) < 1e-6)
+                    
+                    if is_wait_step:
+                        skipped_old_waits += 1
                     else:
-                        if pop_count == 0:
-                            break
+                        popped_moves_count += 1
+                        moves_to_pop -= 1
 
                 # Restore
                 if len(trajectory) > 0:
                     restore_pt = trajectory[-1]
                     model._state = DiffDriveState(x=restore_pt.x, y=restore_pt.y, psi=restore_pt.theta)
                     current_time = restore_pt.t
+                    current_dist = restore_pt.accumulated_dist
                     target_idx = restore_pt.target_idx
-                    self.debugger.record_backtrack(iter_count, prev_pt.t, current_time)
-                    forced_wait_steps = max(forced_wait_steps, skipped_wait_steps + 1)
+                    self.debugger.record_backtrack(iter_count, prev_pt.t, current_time, popped_moves_count)
+                    
+                    # Log Backtrack (Time Drops, Dist Drops)
+                    # We log the NEW state (restored state)
+                    self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, 0.0, 0.0)
+                    
+                    # FORMULA: Old Waits + Rewound Time (No extra +1 needed)
+                    forced_wait_steps = skipped_old_waits + popped_moves_count
                 else:
-                    model._state = DiffDriveState(
-                        x=initial_state_copy.x, y=initial_state_copy.y, psi=initial_state_copy.psi
-                    )
+                    model._state = DiffDriveState(x=initial_state_copy.x, y=initial_state_copy.y, psi=initial_state_copy.psi)
                     current_time = 0.0
-                    target_idx = 0
-                    forced_wait_steps = max(forced_wait_steps, skipped_wait_steps + 1)
+                    current_dist = 0.0
+                    target_idx = 0 
+                    forced_wait_steps = skipped_old_waits + popped_moves_count
+                    
+                    self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, 0.0, 0.0)
 
         return trajectory
