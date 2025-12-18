@@ -45,9 +45,18 @@ class ExactSpaceTimePlanner:
         self.reservations: Dict[int, List[Polygon]] = {}
         self.debugger = PlannerDebugger()
         self.use_stagnation_logic = use_stagnation_logic
-        self.MAX_ITERS = 10000 # [NEW]
+        self.MAX_ITERS = 10000  # [NEW]
 
-    def plan_prioritized(self, robots_sequence, initial_states, waypoints_dict, geometries, params, time_limit: float = 60.0, best_known_makespan: float = float('inf')):
+    def plan_prioritized(
+        self,
+        robots_sequence,
+        initial_states,
+        waypoints_dict,
+        geometries,
+        params,
+        time_limit: float = 60.0,
+        best_known_makespan: float = float("inf"),
+    ):
         final_plans = {}
         self.reservations.clear()
         total_start = time.time()
@@ -66,7 +75,7 @@ class ExactSpaceTimePlanner:
             if time.time() > deadline:
                 print(f"Global Timeout reached before planning {robot_name}. Aborting.")
                 break
-                
+
             # print(f"Planning physics execution for {robot_name}...")
             r_start = time.time()
             # self.debugger.start_robot(robot_name) # [DISABLED] Speed
@@ -80,19 +89,19 @@ class ExactSpaceTimePlanner:
             targets = waypoints_dict.get(robot_name, [])
 
             trajectory = self._plan_single_robot_backtracking(
-                model, 
-                targets, 
+                model,
+                targets,
                 extra_static_obstacles=temp_static_obstacles,
                 deadline=deadline,
-                pruning_threshold=best_known_makespan + 1.0 # [NEW] Pruning limit
+                pruning_threshold=best_known_makespan + 2.0,  # [NEW] Pruning limit
             )
-            
+
             if trajectory is None:
                 # print(f"Planning for {robot_name} failed (Timeout/Pruned). Stopping global plan.")
                 break
-                
+
             final_plans[robot_name] = trajectory
-            
+
             dur = max(0.0, time.time() - r_start)
             # self.debugger.record_planning_time(dur) # [NEW]
             # print(f"  -> Planned {robot_name} in {dur:.2f}s")
@@ -124,12 +133,14 @@ class ExactSpaceTimePlanner:
         # self.debugger.plot_summary(self.static_obstacles) # [DISABLED] Speed
         return final_plans
 
-    def _plan_single_robot_backtracking(self, model, targets, extra_static_obstacles, deadline=None, pruning_threshold=float('inf')):
+    def _plan_single_robot_backtracking(
+        self, model, targets, extra_static_obstacles, deadline=None, pruning_threshold=float("inf")
+    ):
         trajectory: List[PlanPoint] = []
         current_time = 0.0
-        current_dist = 0.0 # [NEW]
+        current_dist = 0.0  # [NEW]
         initial_state_copy = DiffDriveState(x=model._state.x, y=model._state.y, psi=model._state.psi)
-        
+
         # Log Initial State
         self.debugger.record_iteration(0, 0.0, 0, 0.0, 0.0, 0.0)
 
@@ -160,63 +171,63 @@ class ExactSpaceTimePlanner:
 
         target_idx = 0
         forced_wait_steps = 0
-        
+
         # --- ESCALATION STATE ---
         max_progress_idx = 0
-        consecutive_backtrack_count = 0 # [MODIFIED]
-        
+        consecutive_backtrack_count = 0  # [MODIFIED]
+
         # Tuning Parameters
-        L2_THRESHOLD = 3 # [MODIFIED]
-        L3_THRESHOLD = 3 # [MODIFIED]
-        L4_THRESHOLD = 3 # [NEW]
-        L5_THRESHOLD = 3 # [NEW]
-        
+        L2_THRESHOLD = 3  # [MODIFIED]
+        L3_THRESHOLD = 3  # [MODIFIED]
+        L4_THRESHOLD = 3  # [NEW]
+        L5_THRESHOLD = 3  # [NEW]
+
         iter_count = 0
         # MAX_ITERS = 50000
 
         while target_idx < len(targets):
             iter_count += 1
             # [MODIFIED] Moved logging to end of loop for accurate "result of iteration"
-            
+
             # Checks
             if iter_count > self.MAX_ITERS:
                 print(f"WARNING: Max iterations reached. Stopping.")
-                return None # Fail
-            
+                return None  # Fail
+
             if deadline and time.time() > deadline:
-                print(f"Timeout inside planning loop.")
-                return None # Fail
-            
+                # print(f"Timeout inside planning loop.")
+                return None  # Fail
+
             # [NEW] Pruning Check: If current sim time exceeds best known + margin
             if current_time > pruning_threshold:
-                print(f"Pruned: Current time {current_time:.2f}s > Threshold {pruning_threshold:.2f}s")
-                return None # Fail (Not Optimal)
-            
+                # print(f"Pruned: Current time {current_time:.2f}s > Threshold {pruning_threshold:.2f}s")
+                return None  # Fail (Not Optimal)
+
             # 1. Progress Check
             if target_idx > max_progress_idx:
                 max_progress_idx = target_idx
-                consecutive_backtrack_count = 0 # Reset escalation
-            
+                consecutive_backtrack_count = 0  # Reset escalation
+
             # Note: We no longer increment a 'struggle_count' here.
             # We ONLY count explicit backtracks.
 
             # --- PLANNING LOGIC ---
             safe = False
             cmd_v, cmd_w = 0.0, 0.0
-            
+
             if forced_wait_steps > 0:
                 # [WAIT SUBSTITUTION MODE]
                 # We are replaying history with WAITS instead of Moves
                 cmd_v, cmd_w = 0.0, 0.0
                 forced_wait_steps -= 1
-                
+
                 cmd = get_cmds_inverse(0.0, 0.0)
                 next_model = DiffDriveModel(x0=model._state, vg=model.vg, vp=model.vp)
                 next_model.update(cmd, self.decimal_dt)
                 next_poly = next_model.get_footprint()
                 next_time_idx = int(round((current_time + self.dt) / self.dt))
                 safe = is_safe(next_poly, next_time_idx)
-                
+
             else:
                 # [NORMAL GREEDY MODE]
                 tx, ty = targets[target_idx]
@@ -272,7 +283,7 @@ class ExactSpaceTimePlanner:
                 # If rotating in place, dist doesn't change much, or we can use 0 for pure rotation.
                 # Here we use linear velocity contribution.
                 current_dist += abs(cmd_v) * self.dt
-                
+
                 s = model._state
                 trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, cmd_v, cmd_w, target_idx, current_dist))
 
@@ -307,9 +318,11 @@ class ExactSpaceTimePlanner:
                             current_time += self.dt
                             # Wait adds 0 distance
                             s = model._state
-                            trajectory.append(PlanPoint(s.x, s.y, s.psi, current_time, 0.0, 0.0, target_idx, current_dist))
+                            trajectory.append(
+                                PlanPoint(s.x, s.y, s.psi, current_time, 0.0, 0.0, target_idx, current_dist)
+                            )
                             wait_success = True
-                            
+
                             # Log Wait Success
                             self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, 0.0, 0.0)
 
@@ -317,12 +330,12 @@ class ExactSpaceTimePlanner:
                     continue
 
                 # 2. ESCALATING BACKTRACK LOGIC
-                consecutive_backtrack_count += 1 # [MODIFIED] Increment ONLY when we actually backtrack
-                
+                consecutive_backtrack_count += 1  # [MODIFIED] Increment ONLY when we actually backtrack
+
                 # Determine "Pop Magnitude" (Moves, not Steps)
                 moves_to_pop = 1
-                
-                # Logic: L2=3 means "After 3 backtracks, switch to Medium". 
+
+                # Logic: L2=3 means "After 3 backtracks, switch to Medium".
                 # So backtracks #1, #2, #3 are Small. #4 is Medium.
                 # OR does user mean "3 Small, then 3 Medium"?
                 # "Trigger medium ... after a fixed count of used small backtracks"
@@ -332,7 +345,7 @@ class ExactSpaceTimePlanner:
                 # Count 7, 8, 9 -> Large (Pop 5)
                 # Count 10, 11, 12 -> Huge (Pop 10)
                 # Count 13+ -> Massive (Pop 15)
-                
+
                 if consecutive_backtrack_count > (L2_THRESHOLD + L3_THRESHOLD + L4_THRESHOLD + L5_THRESHOLD):
                     moves_to_pop = 15
                 elif consecutive_backtrack_count > (L2_THRESHOLD + L3_THRESHOLD + L4_THRESHOLD):
@@ -341,13 +354,13 @@ class ExactSpaceTimePlanner:
                     moves_to_pop = 5
                 elif consecutive_backtrack_count > L2_THRESHOLD:
                     moves_to_pop = 2
-                
+
                 popped_moves_count = 0
                 skipped_old_waits = 0
-                
+
                 if len(trajectory) == 0:
                     # Cannot backtrack from start - just wait here
-                    model.update(DiffDriveCommands(0,0), self.decimal_dt)
+                    model.update(DiffDriveCommands(0, 0), self.decimal_dt)
                     current_time += self.dt
                     # Start Wait
                     s = model._state
@@ -358,9 +371,9 @@ class ExactSpaceTimePlanner:
                 # Pop Loop: Remove X moves, skipping past waits
                 while len(trajectory) > 0 and moves_to_pop > 0:
                     prev_pt = trajectory.pop()
-                    
-                    is_wait_step = (abs(prev_pt.v) < 1e-6 and abs(prev_pt.w) < 1e-6)
-                    
+
+                    is_wait_step = abs(prev_pt.v) < 1e-6 and abs(prev_pt.w) < 1e-6
+
                     if is_wait_step:
                         skipped_old_waits += 1
                     else:
@@ -375,20 +388,22 @@ class ExactSpaceTimePlanner:
                     current_dist = restore_pt.accumulated_dist
                     target_idx = restore_pt.target_idx
                     self.debugger.record_backtrack(iter_count, prev_pt.t, current_time, popped_moves_count)
-                    
+
                     # Log Backtrack (Time Drops, Dist Drops)
                     # We log the NEW state (restored state)
                     self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, 0.0, 0.0)
-                    
+
                     # FORMULA: Old Waits + Rewound Time (No extra +1 needed)
                     forced_wait_steps = skipped_old_waits + popped_moves_count
                 else:
-                    model._state = DiffDriveState(x=initial_state_copy.x, y=initial_state_copy.y, psi=initial_state_copy.psi)
+                    model._state = DiffDriveState(
+                        x=initial_state_copy.x, y=initial_state_copy.y, psi=initial_state_copy.psi
+                    )
                     current_time = 0.0
                     current_dist = 0.0
-                    target_idx = 0 
+                    target_idx = 0
                     forced_wait_steps = skipped_old_waits + popped_moves_count
-                    
+
                     self.debugger.record_iteration(iter_count, current_time, target_idx, current_dist, 0.0, 0.0)
 
         return trajectory

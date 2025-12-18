@@ -41,6 +41,7 @@ from .task_allocator import (
     TaskAllocatorLNS2,
     TaskAllocatorLNS3,
     TaskAllocatorALNS,
+    TaskAllocatorBase,
 )
 from .spacetime_planner import SpaceTimeRoadmapPlanner
 from .exact_spacetime_planner import ExactSpaceTimePlanner, PlanPoint
@@ -419,7 +420,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
 
         # 2. Pick Top 5 Unique Assignments to test
         # (Deduplication based on cost is a simple proxy, or just take top 5)
-        top_candidates = candidates[:10]
+        top_candidates = candidates[:15]
 
         print(f"\n>> SELECTED TOP {len(top_candidates)} CANDIDATES FOR PHYSICS EVALUATION:")
         for name, _, cost in top_candidates:
@@ -439,8 +440,14 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         viz = TournamentVisualizer()  # [NEW]
         viz_helper = PlannerVisualizer(robot_radius=self.robot_radius)  # [NEW]
 
+        # [NEW] Cost Helper for accurate theoretical verification & bottleneck identification
+        cost_helper = TaskAllocatorBase(**alloc_args)
+
         for cand_name, cand_assign, cand_theo_cost in top_candidates:
-            # print(f"\n   [Evaluating {cand_name}] ...")
+            # [NEW] Pruning: If theoretical cost is already worse than best found actual cost (minus margin), stop.
+            if (cand_theo_cost - 1.0) > best_actual_makespan:
+                print(f"   -> Pruning remaining candidates. Next theo {cand_theo_cost:.2f} > Best actual {best_actual_makespan:.2f}")
+                break
 
             # --- A. Prepare Waypoints ---
             robot_waypoints = {}
@@ -452,16 +459,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             robot_last_task_idx = {}
 
             # [NEW] Identify Bottleneck Robot
-            # We estimate cost using the pre-computed cost_matrix
-            robot_costs = {}
-            for r, t_list in cand_assign.items():
-                c_node = r
-                cost = 0.0
-                for t in t_list:
-                    cost += cost_matrix.get(c_node, {}).get(t.goal_id, 100.0)
-                    cost += cost_matrix.get(t.goal_id, {}).get(t.collection_id, 100.0)
-                    c_node = t.collection_id
-                robot_costs[r] = cost
+            # We use the Allocator logic to get accurate costs (including turns)
+            robot_costs = {r: cost_helper._calculate_schedule_duration(r, t_list) for r, t_list in cand_assign.items()}
             
             bottleneck_r = max(robot_costs, key=robot_costs.get) if robot_costs else None
 
@@ -556,48 +555,68 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                         straight_success = False
                         
                         if seg_len_sq > 1e-6:
-                            # Project Center onto P->N to find closest point
-                            # t = dot(Center-P, N-P) / |N-P|^2
+                            # Project Center onto P->N
                             t = ((curr_center[0] - prev_node[0]) * dx + (curr_center[1] - prev_node[1]) * dy) / seg_len_sq
-                            t = max(0.0, min(1.0, t)) # Clamp to segment
-                            
+                            t = max(0.0, min(1.0, t))
                             proj_x = prev_node[0] + t * dx
                             proj_y = prev_node[1] + t * dy
-                            
                             dist_sq = (curr_center[0] - proj_x)**2 + (curr_center[1] - proj_y)**2
                             
-                            # If straight line passes strictly INSIDE the radius (margin safe)
                             if dist_sq < (radius * 0.99)**2:
-                                # Verify collision for the WHOLE straight segment
                                 if self._check_line_validity(prev_node, next_node, obstacle_tree, inflated_obstacles):
-                                    # SUCCESS: Go Straight
-                                    opt_pos = (proj_x, proj_y)
-                                    seg_in[-1] = opt_pos
-                                    seg_out[0] = opt_pos
+                                    seg_in[-1] = (proj_x, proj_y)
+                                    seg_out[0] = (proj_x, proj_y)
                                     straight_success = True
                         
                         if not straight_success:
                             # [NEW] Check 2: Corner Cut (Bisector)
-                            opt_pos = self._optimize_node_pos(
-                                prev_node, curr_center, next_node, radius
-                            )
+                            opt_pos = self._optimize_node_pos(prev_node, curr_center, next_node, radius)
+                            valid_in = self._check_line_validity(prev_node, opt_pos, obstacle_tree, inflated_obstacles)
+                            valid_out = self._check_line_validity(opt_pos, next_node, obstacle_tree, inflated_obstacles)
                             
-                            # Check Length Improvement
-                            d_old = math.hypot(curr_center[0]-prev_node[0], curr_center[1]-prev_node[1]) + \
-                                    math.hypot(next_node[0]-curr_center[0], next_node[1]-curr_center[1])
-                            
-                            d_new = math.hypot(opt_pos[0]-prev_node[0], opt_pos[1]-prev_node[1]) + \
-                                    math.hypot(next_node[0]-opt_pos[0], next_node[1]-opt_pos[1])
-                            
-                            if d_new < d_old:
-                                # Check Safety
-                                valid_in = self._check_line_validity(prev_node, opt_pos, obstacle_tree, inflated_obstacles)
-                                valid_out = self._check_line_validity(opt_pos, next_node, obstacle_tree, inflated_obstacles)
-                                
-                                if valid_in and valid_out:
-                                    # Apply Update
+                            bisector_applied = False
+                            if valid_in and valid_out:
+                                d_old = math.hypot(curr_center[0]-prev_node[0], curr_center[1]-prev_node[1]) + \
+                                        math.hypot(next_node[0]-curr_center[0], next_node[1]-curr_center[1])
+                                d_new = math.hypot(opt_pos[0]-prev_node[0], opt_pos[1]-prev_node[1]) + \
+                                        math.hypot(next_node[0]-opt_pos[0], next_node[1]-opt_pos[1])
+                                if d_new < d_old:
                                     seg_in[-1] = opt_pos
                                     seg_out[0] = opt_pos
+                                    bisector_applied = True
+                            
+                            # [NEW] Check 3: Asymmetric Fallback
+                            if not bisector_applied:
+                                # Case A: Incoming Blocked -> Move towards Prev (Safe Incoming)
+                                if not valid_in and valid_out:
+                                    # P_in is on Prev->Center
+                                    v_in_x = prev_node[0] - curr_center[0]
+                                    v_in_y = prev_node[1] - curr_center[1]
+                                    len_in = math.hypot(v_in_x, v_in_y)
+                                    if len_in > radius:
+                                        # Point at radius distance from Center towards Prev
+                                        scale = radius / len_in
+                                        p_in = (curr_center[0] + v_in_x * scale, curr_center[1] + v_in_y * scale)
+                                        # Prev->P_in is safe (subset of original). Check P_in->Next
+                                        if self._check_line_validity(p_in, next_node, obstacle_tree, inflated_obstacles):
+                                            seg_in[-1] = p_in
+                                            seg_out[0] = p_in
+                                            bisector_applied = True # Mark as done
+
+                                # Case B: Outgoing Blocked -> Move towards Next (Safe Outgoing)
+                                if not bisector_applied and valid_in and not valid_out:
+                                    # P_out is on Center->Next
+                                    v_out_x = next_node[0] - curr_center[0]
+                                    v_out_y = next_node[1] - curr_center[1]
+                                    len_out = math.hypot(v_out_x, v_out_y)
+                                    if len_out > radius:
+                                        # Point at radius distance from Center towards Next
+                                        scale = radius / len_out
+                                        p_out = (curr_center[0] + v_out_x * scale, curr_center[1] + v_out_y * scale)
+                                        # P_out->Next is safe. Check Prev->P_out
+                                        if self._check_line_validity(prev_node, p_out, obstacle_tree, inflated_obstacles):
+                                            seg_in[-1] = p_out
+                                            seg_out[0] = p_out
 
                 # --- 3. Flatten to Waypoints ---
                 wps = []
@@ -661,7 +680,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     waypoints_dict=robot_waypoints,
                     geometries=geometries,
                     params=params,
-                    time_limit=4.0, 
+                    time_limit=5.0, 
                     best_known_makespan=current_threshold
                 )
                 plan_dur = time.time() - plan_start_t
@@ -700,6 +719,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     cand_best_makespan = perm_makespan
                     cand_best_plans = plans_6d
                     cand_is_valid = True
+                    # print(f"      -> Permutation {sorted_robots} yielded {perm_makespan:.2f}s")
             
             status_str = "VALID" if cand_is_valid else "INVALID"
             # print(f"   -> Result {cand_name}: Theo={cand_theo_cost:.2f}s | BestActual={cand_best_makespan:.2f}s | Status={status_str}")
