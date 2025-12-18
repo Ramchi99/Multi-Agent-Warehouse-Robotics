@@ -5,6 +5,7 @@ import math
 import csv  # [NEW]
 from re import A
 import time
+import itertools  # [NEW]
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Mapping, Sequence, Tuple, List, Optional, Dict, Any
@@ -243,12 +244,12 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.num_samples = 2000  # Can handle more samples now # 2000
         self.target_degree = 20  # We WANT this many connections per node
         self.max_candidates = 50  # We CHECK this many to find the valid ones (handles deleted vertices)
-        self.robot_radius = 0.6 + 0.1  # Buffer size (robot width/2 + margin)
+        self.robot_radius = 0.6 + 0.01  # Buffer size (robot width/2 + margin)
         self.connection_radius = 10.0  # Max length of an edge
         self.min_sample_dist = 0.3  # Minimum distance between nodes # 0.3
         self.turn_penalty = 0.0  # Heuristic cost for "stopping and turning" (meters equivalent)
 
-        self.time_limit = 10.0  # Time limit for task allocation # 10.0
+        self.time_limit = 15.0  # Time limit for task allocation # 10.0
 
         self.seed = 42
 
@@ -450,6 +451,20 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             # Track where the "real work" ends for each robot
             robot_last_task_idx = {}
 
+            # [NEW] Identify Bottleneck Robot
+            # We estimate cost using the pre-computed cost_matrix
+            robot_costs = {}
+            for r, t_list in cand_assign.items():
+                c_node = r
+                cost = 0.0
+                for t in t_list:
+                    cost += cost_matrix.get(c_node, {}).get(t.goal_id, 100.0)
+                    cost += cost_matrix.get(t.goal_id, {}).get(t.collection_id, 100.0)
+                    c_node = t.collection_id
+                robot_costs[r] = cost
+            
+            bottleneck_r = max(robot_costs, key=robot_costs.get) if robot_costs else None
+
             for r_name, tasks in cand_assign.items():
                 # Physics Data
                 p_obs = init_sim_obs.players_obs[r_name]
@@ -460,30 +475,148 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 raw_s = init_sim_obs.initial_states[r_name]
                 initial_states_obj[r_name] = DiffDriveState(x=float(raw_s.x), y=float(raw_s.y), psi=float(raw_s.psi))
 
-                # Waypoints
-                wps = []
+                # --- 1. Generate Raw Path Segments ---
+                raw_segments = []
+                # Store metadata for optimization: (Type, ID)
+                junction_meta = [] 
+                
                 curr_node = r_name
+                
                 for task in tasks:
-                    # Path -> Goal
+                    # Seg 1: Curr -> Goal
                     seg = self._find_path_coords_raw(path_data, curr_node, task.goal_id)
-                    if seg:
-                        wps.extend(seg[1:])
+                    if not seg: seg = [self._get_node_pos(curr_node, initial_nodes_data), self._get_node_pos(task.goal_id, initial_nodes_data)]
+                    raw_segments.append(list(seg))
+                    junction_meta.append(("goal", task.goal_id))
                     curr_node = task.goal_id
 
-                    # Path -> Collection
+                    # Seg 2: Goal -> Collection
                     seg = self._find_path_coords_raw(path_data, curr_node, task.collection_id)
-                    if seg:
-                        wps.extend(seg[1:])
+                    if not seg: seg = [self._get_node_pos(curr_node, initial_nodes_data), self._get_node_pos(task.collection_id, initial_nodes_data)]
+                    raw_segments.append(list(seg))
+                    junction_meta.append(("collection", task.collection_id))
                     curr_node = task.collection_id
-
-                # [NEW] Mark the end of tasks
-                robot_last_task_idx[r_name] = len(wps)
 
                 # Return to Start
                 seg = self._find_path_coords_raw(path_data, curr_node, r_name)
-                if seg:
-                    wps.extend(seg[1:])
+                if seg: 
+                    raw_segments.append(list(seg))
+                    junction_meta.append(("start", r_name))
 
+                # --- 2. Optimize Junctions ---
+                # Optimization happens at the junction between segment i and i+1.
+                # The "Target" being optimized is the END of segment i.
+                # The metadata for that target is at junction_meta[i].
+                
+                for i in range(len(raw_segments) - 1):
+                    seg_in = raw_segments[i]
+                    seg_out = raw_segments[i+1]
+                    
+                    if len(seg_in) < 2 or len(seg_out) < 2:
+                        continue
+                        
+                    curr_center = seg_in[-1]
+                    prev_node = seg_in[-2]
+                    next_node = seg_out[1]
+                    
+                    # Metadata
+                    j_type, j_id = junction_meta[i]
+                    
+                    # Dynamic Radius Calculation
+                    radius = 0.0
+                    margin = 0.01
+                    
+                    if j_type == "goal":
+                        g_obj = init_sim_obs.shared_goals[j_id]
+                        # Safe radius = distance from centroid to boundary
+                        r_poly = g_obj.polygon.boundary.distance(g_obj.polygon.centroid)
+                        radius = max(0.0, r_poly - margin)
+                    elif j_type == "collection":
+                        c_obj = init_sim_obs.collection_points[j_id]
+                        r_poly = c_obj.polygon.boundary.distance(c_obj.polygon.centroid)
+                        radius = max(0.0, r_poly - margin)
+                    
+                    # Bottleneck Logic
+                    # If this is the LAST junction (connecting to Start) AND robot is bottleneck
+                    is_last_junction = (i == len(raw_segments) - 2)
+                    # Note: len(raw_segments)-1 is the index of the last segment.
+                    # Loop goes up to len(raw_segments)-2.
+                    # So 'i' is the current segment index. 
+                    # If i == len-2, then seg_out is the last segment (Return to Start).
+                    
+                    if is_last_junction and (r_name == bottleneck_r):
+                        radius = 0.0 # Disable optimization for bottleneck return
+                    
+                    if radius > 0:
+                        # [NEW] Check 1: Can we just go straight? (Shortest possible path)
+                        dx = next_node[0] - prev_node[0]
+                        dy = next_node[1] - prev_node[1]
+                        seg_len_sq = dx*dx + dy*dy
+                        
+                        straight_success = False
+                        
+                        if seg_len_sq > 1e-6:
+                            # Project Center onto P->N to find closest point
+                            # t = dot(Center-P, N-P) / |N-P|^2
+                            t = ((curr_center[0] - prev_node[0]) * dx + (curr_center[1] - prev_node[1]) * dy) / seg_len_sq
+                            t = max(0.0, min(1.0, t)) # Clamp to segment
+                            
+                            proj_x = prev_node[0] + t * dx
+                            proj_y = prev_node[1] + t * dy
+                            
+                            dist_sq = (curr_center[0] - proj_x)**2 + (curr_center[1] - proj_y)**2
+                            
+                            # If straight line passes strictly INSIDE the radius (margin safe)
+                            if dist_sq < (radius * 0.99)**2:
+                                # Verify collision for the WHOLE straight segment
+                                if self._check_line_validity(prev_node, next_node, obstacle_tree, inflated_obstacles):
+                                    # SUCCESS: Go Straight
+                                    opt_pos = (proj_x, proj_y)
+                                    seg_in[-1] = opt_pos
+                                    seg_out[0] = opt_pos
+                                    straight_success = True
+                        
+                        if not straight_success:
+                            # [NEW] Check 2: Corner Cut (Bisector)
+                            opt_pos = self._optimize_node_pos(
+                                prev_node, curr_center, next_node, radius
+                            )
+                            
+                            # Check Length Improvement
+                            d_old = math.hypot(curr_center[0]-prev_node[0], curr_center[1]-prev_node[1]) + \
+                                    math.hypot(next_node[0]-curr_center[0], next_node[1]-curr_center[1])
+                            
+                            d_new = math.hypot(opt_pos[0]-prev_node[0], opt_pos[1]-prev_node[1]) + \
+                                    math.hypot(next_node[0]-opt_pos[0], next_node[1]-opt_pos[1])
+                            
+                            if d_new < d_old:
+                                # Check Safety
+                                valid_in = self._check_line_validity(prev_node, opt_pos, obstacle_tree, inflated_obstacles)
+                                valid_out = self._check_line_validity(opt_pos, next_node, obstacle_tree, inflated_obstacles)
+                                
+                                if valid_in and valid_out:
+                                    # Apply Update
+                                    seg_in[-1] = opt_pos
+                                    seg_out[0] = opt_pos
+
+                # --- 3. Flatten to Waypoints ---
+                wps = []
+                for i, seg in enumerate(raw_segments):
+                    if i == 0:
+                        wps.extend(seg)
+                    else:
+                        wps.extend(seg[1:])
+
+                # Mark the end of tasks
+                num_task_segments = len(tasks) * 2
+                count_wps = 0
+                for i in range(num_task_segments):
+                    if i < len(raw_segments):
+                        seg_len = len(raw_segments[i])
+                        if i == 0: count_wps += seg_len
+                        else: count_wps += (seg_len - 1)
+                
+                robot_last_task_idx[r_name] = count_wps
                 robot_waypoints[r_name] = wps
 
             # --- B. Calculate Priority (Longest Delivery First) ---
@@ -498,126 +631,95 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     delivery_duration += t_coll
                     curr_node = task.collection_id
                 robot_priority_list.append((r_name, delivery_duration))
-
+            
             robot_priority_list.sort(key=lambda x: x[1], reverse=True)
-            sorted_robots = [r for r, c in robot_priority_list]
-            # print(f"     Priority: {sorted_robots}")
-
-            # --- C. Run Exact Planner ---
+            heuristic_order = tuple([r for r, c in robot_priority_list])
+            
+            # [NEW] Generate ALL Permutations (Heuristic First)
+            all_perms = list(itertools.permutations(cand_assign.keys()))
+            if heuristic_order in all_perms:
+                all_perms.remove(heuristic_order)
+            priority_candidates = [heuristic_order] + all_perms
+            
+            # Track best result FOR THIS CANDIDATE across all permutations
+            cand_best_makespan = float('inf')
+            cand_best_plans = {}
+            cand_is_valid = False
+            
+            # --- C. Run Exact Planner (Permutation Loop) ---
             # Instantiate fresh planner for each candidate
             exact_planner = ExactSpaceTimePlanner(static_obstacles=static_obs_polys, dt=0.1, use_stagnation_logic=False)
+            
+            for perm_idx, sorted_robots in enumerate(priority_candidates):
+                # Pruning Threshold: Beating GLOBAL best OR CANDIDATE best
+                current_threshold = min(best_actual_makespan, cand_best_makespan)
+                
+                plan_start_t = time.time()
+                plans_6d = exact_planner.plan_prioritized(
+                    robots_sequence=sorted_robots,
+                    initial_states=initial_states_obj,
+                    waypoints_dict=robot_waypoints,
+                    geometries=geometries,
+                    params=params,
+                    time_limit=4.0, 
+                    best_known_makespan=current_threshold
+                )
+                plan_dur = time.time() - plan_start_t
+                
+                # Validity Check (Complete Plan)
+                if len(plans_6d) != len(cand_assign):
+                    continue # Timeout or Pruned
+                
+                # Measure Actual Makespan
+                perm_makespan = 0.0
+                perm_valid = True
+                
+                for r_name, r_traj in plans_6d.items():
+                    if not r_traj: 
+                        perm_valid = False; break
+                    
+                    limit_idx = robot_last_task_idx.get(r_name, 0)
+                    delivery_t = 0.0
+                    found = False
+                    
+                    if r_traj[-1].target_idx < limit_idx:
+                        perm_valid = False
+                    
+                    for pt in r_traj:
+                        if pt.target_idx >= limit_idx:
+                            delivery_t = pt.t
+                            found = True
+                            break
+                    if not found: delivery_t = r_traj[-1].t
+                    perm_makespan = max(perm_makespan, delivery_t)
+                
+                if not perm_valid: continue
 
-            plan_start_t = time.time()
-            plans_6d = exact_planner.plan_prioritized(
-                robots_sequence=sorted_robots,
-                initial_states=initial_states_obj,
-                waypoints_dict=robot_waypoints,
-                geometries=geometries,
-                params=params,
-                time_limit=10.0,  # [MODIFIED]
-                best_known_makespan=best_actual_makespan,  # [NEW] Pruning
-            )
-            plan_dur = time.time() - plan_start_t
-
-            # --- D. Measure Actual Makespan (Delivery Only) & Validity ---
-            actual_makespan = 0.0
-            is_valid_candidate = True
-
-            # [MODIFIED] Check if all robots were planned (timeout check)
-            if len(plans_6d) != len(cand_assign):
-                is_valid_candidate = False
-                # print(f"     [Fail] Incomplete plan (Timeout/Pruned). Got {len(plans_6d)}/{len(cand_assign)} robots.")
-
-            # 1. Check Task Completion
-            for r_name, r_traj in plans_6d.items():
-                if not r_traj:
-                    is_valid_candidate = False
-                    continue
-
-                limit_idx = robot_last_task_idx.get(r_name, 0)
-                delivery_t = 0.0
-                found = False
-
-                if r_traj[-1].target_idx < limit_idx:
-                    is_valid_candidate = False
-
-                for pt in r_traj:
-                    if pt.target_idx >= limit_idx:
-                        delivery_t = pt.t
-                        found = True
-                        break
-
-                if not found:
-                    delivery_t = r_traj[-1].t
-
-                actual_makespan = max(actual_makespan, delivery_t)
-
-            # 2. Gather Stats & Check MAX_ITERS
-            total_backtracks = 0
-            total_collisions = 0
-            total_iterations = 0
-            per_robot_times = []
-            per_robot_iters = []
-
-            if exact_planner.debugger and exact_planner.debugger.logs:
-                for r_name in sorted_robots:
-                    r_log = exact_planner.debugger.logs.get(r_name, {})
-
-                    total_backtracks += len(r_log.get("backtracks", []))
-                    total_collisions += len(r_log.get("collisions", []))
-
-                    iters_list = r_log.get("iterations", [])
-                    it = iters_list[-1] if iters_list else 0
-                    t = max(0.0, r_log.get("wall_time", 0.0))
-
-                    if it >= exact_planner.MAX_ITERS:
-                        is_valid_candidate = False
-                        # print(f"     [Fail] Robot {r_name} hit MAX_ITERS ({it})")
-
-                    total_iterations += it
-                    per_robot_times.append(t)
-                    per_robot_iters.append(it)
-
-            # 3. Record & Print Result (AFTER Validity Update)
-            # viz.record_result(
-            #     cand_name,
-            #     cand_theo_cost,
-            #     actual_makespan,
-            #     plan_dur,
-            #     total_backtracks,
-            #     total_collisions,
-            #     total_iterations,
-            #     per_robot_times,
-            #     per_robot_iters,
-            #     is_valid=is_valid_candidate,
-            # )
-
-            status_str = "VALID" if is_valid_candidate else "INVALID"
-            # print(
-            #     f"   -> Result {cand_name}: Theo={cand_theo_cost:.2f}s | Actual={actual_makespan:.2f}s | Status={status_str}"
-            # )
-
+                # Better Result Found?
+                if perm_makespan < cand_best_makespan:
+                    cand_best_makespan = perm_makespan
+                    cand_best_plans = plans_6d
+                    cand_is_valid = True
+            
+            status_str = "VALID" if cand_is_valid else "INVALID"
+            # print(f"   -> Result {cand_name}: Theo={cand_theo_cost:.2f}s | BestActual={cand_best_makespan:.2f}s | Status={status_str}")
+            
             # 4. Update Winner
-            if "best_is_valid" not in locals():
-                best_is_valid = False
+            if 'best_is_valid' not in locals(): best_is_valid = False
             better_found = False
-
-            if is_valid_candidate and not best_is_valid:
+            
+            if cand_is_valid and not best_is_valid:
                 better_found = True
-            elif is_valid_candidate and best_is_valid:
-                if actual_makespan < best_actual_makespan:
+            elif cand_is_valid and best_is_valid:
+                if cand_best_makespan < best_actual_makespan:
                     better_found = True
-            elif not is_valid_candidate and not best_is_valid:
-                if actual_makespan < best_actual_makespan:
-                    better_found = True
-
+            
             if better_found:
-                best_actual_makespan = actual_makespan
-                best_final_plans_6d = plans_6d
+                best_actual_makespan = cand_best_makespan
+                best_final_plans_6d = cand_best_plans
                 winner_name = cand_name
                 best_waypoints = robot_waypoints
-                best_is_valid = is_valid_candidate
-
+                best_is_valid = cand_is_valid
         # Plot Summary
         # viz.plot_all()
 
@@ -864,6 +966,35 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             current_idx = best_next_idx
 
         return smoothed
+
+    def _get_node_pos(self, label, initial_nodes_data):
+        for x, y, _, l in initial_nodes_data:
+            if l == label:
+                return (x, y)
+        return (0,0)
+
+    def _check_line_validity(self, p1, p2, obstacle_tree, inflated_obstacles):
+        line = LineString([p1, p2])
+        possible = obstacle_tree.query(line)
+        for idx in possible:
+            if inflated_obstacles[idx].intersects(line):
+                return False
+        return True
+
+    def _optimize_node_pos(self, prev, center, next_p, radius):
+        v1 = np.array(prev) - np.array(center)
+        v2 = np.array(next_p) - np.array(center)
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-6 or n2 < 1e-6: return center
+        u1 = v1 / n1
+        u2 = v2 / n2
+        direction = u1 + u2
+        n_dir = np.linalg.norm(direction)
+        if n_dir < 1e-6: return center
+        u_dir = direction / n_dir
+        new_pt = np.array(center) + u_dir * radius
+        return tuple(new_pt)
 
     def _find_path_coords_raw(self, path_data, src, dst):
         """

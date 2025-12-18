@@ -36,7 +36,7 @@ class PlanPoint:
 
 class ExactSpaceTimePlanner:
     def __init__(
-        self, static_obstacles: List[Polygon], dt: float = 0.1, margin: float = 0.1, use_stagnation_logic: bool = True
+        self, static_obstacles: List[Polygon], dt: float = 0.1, margin: float = 0.01, use_stagnation_logic: bool = True
     ):
         self.static_obstacles = static_obstacles
         self.dt = dt
