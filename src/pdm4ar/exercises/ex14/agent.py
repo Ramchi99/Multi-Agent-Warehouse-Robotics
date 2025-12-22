@@ -255,6 +255,10 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         self.seed = 42
 
     def send_plan(self, init_sim_obs: InitSimGlobalObservations) -> str:
+        # [NEW] TIMING LOG
+        DEBUG_TIMING = False
+        t_start_global = time.time()
+        
         random.seed(self.seed)
         np.random.seed(self.seed)
 
@@ -310,7 +314,9 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     collections_list.append(cid)
 
         # --- 3. BUILD PRM ---
+        t_prm_start = time.time()
         G = self._build_prm(inflated_obstacles, initial_nodes_data, bounds)
+        if DEBUG_TIMING: print(f"[TIME] PRM Build: {time.time() - t_prm_start:.3f}s")
 
         # 4. Get Initial Headings
         initial_headings = {}
@@ -371,9 +377,11 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # lns3_cost = allocator_lns3._evaluate_makespan({r: RobotSchedule(r, t) for r, t in lns3_assignments.items()})
 
         # E. Run ALNS (Adaptive)
+        t_alns_start = time.time()
         allocator_alns = TaskAllocatorALNS(**alloc_args)
         alns_assignments, alns_telemetry, alns_top_k = allocator_alns.solve(time_limit=self.time_limit)
         alns_cost = allocator_alns._evaluate_makespan({r: RobotSchedule(r, t) for r, t in alns_assignments.items()})
+        if DEBUG_TIMING: print(f"[TIME] ALNS Allocator: {time.time() - t_alns_start:.3f}s")
 
         # Telemetry Processing
         alns_hist = [(entry["time"], entry["best_cost"]) for entry in alns_telemetry]
@@ -443,7 +451,18 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         # [NEW] Cost Helper for accurate theoretical verification & bottleneck identification
         cost_helper = TaskAllocatorBase(**alloc_args)
 
+        # [NEW] Global Tournament Timer
+        TOURNAMENT_TIME_LIMIT = 25.0
+        tournament_start_time = time.time()
+
         for cand_name, cand_assign, cand_theo_cost in top_candidates:
+            t_cand_start = time.time()
+            
+            # Global Timeout Check
+            if (time.time() - tournament_start_time) > TOURNAMENT_TIME_LIMIT:
+                print(f"   -> Tournament GLOBAL TIMEOUT after {cand_name}")
+                break
+
             # [NEW] Pruning: If theoretical cost is already worse than best found actual cost (minus margin), stop.
             if (cand_theo_cost - 1.0) > best_actual_makespan:
                 print(f"   -> Pruning remaining candidates. Next theo {cand_theo_cost:.2f} > Best actual {best_actual_makespan:.2f}")
@@ -669,7 +688,15 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
             # Instantiate fresh planner for each candidate
             exact_planner = ExactSpaceTimePlanner(static_obstacles=static_obs_polys, dt=0.1, use_stagnation_logic=False)
             
+            PERM_TIME_LIMIT = 5.0 # Limit search for optimal priority
+            perm_start_time = time.time()
+            
             for perm_idx, sorted_robots in enumerate(priority_candidates):
+                # Time Check
+                if (time.time() - perm_start_time) > PERM_TIME_LIMIT:
+                    print(f"   -> Permutation search timeout after {perm_idx} tries.")
+                    break
+
                 # Pruning Threshold: Beating GLOBAL best OR CANDIDATE best
                 current_threshold = min(best_actual_makespan, cand_best_makespan)
                 
@@ -683,6 +710,7 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                     time_limit=5.0, 
                     best_known_makespan=current_threshold
                 )
+                if DEBUG_TIMING: print(f"      [TIME] Planner: {time.time() - plan_start_t:.3f}s")
                 plan_dur = time.time() - plan_start_t
                 
                 # Validity Check (Complete Plan)
@@ -740,8 +768,8 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
                 winner_name = cand_name
                 best_waypoints = robot_waypoints
                 best_is_valid = cand_is_valid
-        # Plot Summary
-        # viz.plot_all()
+            
+            if DEBUG_TIMING: print(f"   [TIME] Candidate {cand_name}: {time.time() - t_cand_start:.3f}s")
 
         # ---------------------------------------------------------------------
         # --- 4. Finalize Winner ---
@@ -768,7 +796,22 @@ class Pdm4arGlobalPlanner(GlobalPlanner):
         #     filename=str(out_dir / f"traj_debug_{timestamp}.png"),
         # )
 
-        return global_plan_message.model_dump_json(round_trip=True)
+        if DEBUG_TIMING: print(f"[TIME] Total send_plan: {time.time() - t_start_global:.3f}s")
+
+        # 1. Perform the heavy serialization explicitly
+        json_start = time.time()
+        json_output = global_plan_message.model_dump_json(round_trip=True)
+        json_dur = time.time() - json_start
+
+        # 2. Print the TOTAL time (including serialization)
+        if DEBUG_TIMING: 
+            print(f"[TIME] JSON Serialization: {json_dur:.3f}s")
+            print(f"[TIME] Total send_plan: {time.time() - t_start_global:.3f}s")
+        
+        # 3. Return the pre-calculated string
+        return json_output
+
+        #return global_plan_message.model_dump_json(round_trip=True)
 
     def _find_path_coords(self, path_data, src, dst):
         """Helper to find path coordinates from any bucket"""

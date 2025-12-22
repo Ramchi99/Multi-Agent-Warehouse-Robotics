@@ -23,6 +23,12 @@ agents:
       y: 5.0
       psi: 0.0
     color: gold
+  PDM4AR_5:
+    state:
+      x: 9.0
+      y: -8.0
+      psi: 0.0
+    color: gold
 static_obstacles:
 - - - 1.2703945759730217
     - 2.5092471896670387
