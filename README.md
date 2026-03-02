@@ -1,4 +1,4 @@
-# Multi-Agent Warehouse Logistics
+# Multi-Agent-Warehouse-Robotics
 
 *🏆 **Ranked 1st out of 120 student groups** on the private test cases in the Planning and Decision Making for Autonomous Robots (PDM4AR) master's course at ETH Zurich.*
 
