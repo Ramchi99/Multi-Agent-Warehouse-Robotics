@@ -63,8 +63,8 @@ ipykernel = "6.29.5"
 pre-commit = "3.8.0"
 pydantic = "2.12.4"
 numpydantic = "1.7.0"
-#setuptools = "*"
-#wheel = "*"
+setuptools = "<70.0.0"
+wheel = "*"
 
 
 [tool.poetry.scripts]
